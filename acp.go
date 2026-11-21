@@ -142,7 +142,9 @@ func (p *acpPeer) read() {
 			return
 		}
 		var msg rpcMessage
-		if validateJSON(line, 64) != nil || json.Unmarshal(line, &msg) != nil || msg.Version != "2.0" {
+		// ACP tool output may contain escaped NULs. Text shown in CED goes
+		// through displayText before it reaches the native widgets.
+		if validateJSON(line, 64, true) != nil || json.Unmarshal(line, &msg) != nil || msg.Version != "2.0" {
 			p.readErr = errors.New("The ACP adapter sent an invalid JSON-RPC message.")
 			return
 		}

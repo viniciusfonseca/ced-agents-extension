@@ -16,8 +16,13 @@ import (
 const maxPrompt = 8 << 10
 
 type chatMessage struct {
-	Role string `json:"role"`
-	Text string `json:"text"`
+	Role       string `json:"role"`
+	Text       string `json:"text"`
+	ID         string `json:"id,omitempty"`
+	Status     string `json:"status,omitempty"`
+	Input      string `json:"input,omitempty"`
+	Output     string `json:"output,omitempty"`
+	toolCallID string
 }
 
 type permissionOption struct {
@@ -59,6 +64,7 @@ type session struct {
 	splitMessage   bool
 	replayMessage  string
 	totalText      int
+	nextActivity   uint64
 }
 
 func boundedText(text string, maxBytes int) string {
@@ -83,16 +89,36 @@ func (s *session) appendMessage(role, text string) {
 		s.Messages[last].Text += addition
 		s.totalText += len(addition)
 	} else {
-		s.Messages = append(s.Messages, chatMessage{Role: role, Text: text})
-		s.totalText += len(text)
+		message := chatMessage{Role: role, Text: text}
+		if role == "agent" && s.Connected {
+			message.ID = s.activityID()
+		}
+		if role == "reasoning" {
+			message.ID = s.activityID()
+			if s.Connected {
+				message.Status = "running"
+			}
+		}
+		s.addMessage(message)
 	}
 	s.splitMessage = false
+	s.trimMessages()
+	s.Revision++
+}
+
+func (s *session) addMessage(message chatMessage) {
+	s.endReasoning()
+	s.Messages = append(s.Messages, message)
+	s.totalText += len(message.Text)
+	s.trimMessages()
+}
+
+func (s *session) trimMessages() {
 	for len(s.Messages) > 1 && (s.totalText > 512<<10 || len(s.Messages) > 240) {
 		s.totalText -= len(s.Messages[0].Text)
 		s.Messages[0] = chatMessage{}
 		s.Messages = s.Messages[1:]
 	}
-	s.Revision++
 }
 
 type sessions struct {
@@ -231,6 +257,7 @@ func (m *sessions) finish(s *session, err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s.Busy, s.Permission = false, nil
+	s.endReasoning()
 	s.permissionRPC = nil
 	if err != nil {
 		s.Error = boundedText(err.Error(), 1024)
@@ -349,11 +376,7 @@ func (m *sessions) update(s *session, p *acpPeer, msg rpcMessage) {
 	case "session/update":
 		var params struct {
 			SessionID string
-			Update    struct {
-				configResponse
-				SessionUpdate, Title, MessageID string
-				Content                         struct{ Type, Text string }
-			}
+			Update    sessionUpdate
 		}
 		if msg.ID != nil || json.Unmarshal(msg.Params, &params) != nil || params.SessionID == "" {
 			return
@@ -365,18 +388,26 @@ func (m *sessions) update(s *session, p *acpPeer, msg rpcMessage) {
 		}
 		update := params.Update
 		switch update.SessionUpdate {
-		case "agent_message_chunk", "user_message_chunk":
+		case "agent_message_chunk", "user_message_chunk", "agent_thought_chunk":
 			replaying := s.savedID != "" && !s.Connected && s.Busy
-			if s.Busy && s.remoteID != "" && update.Content.Type == "text" {
-				if replaying && update.MessageID != s.replayMessage {
-					s.splitMessage = true
-					s.replayMessage = update.MessageID
-				}
-				if update.SessionUpdate == "agent_message_chunk" {
-					s.appendMessage("agent", update.Content.Text)
-				} else if replaying {
-					s.appendMessage("user", update.Content.Text)
-				}
+			if !s.Busy || s.remoteID == "" || (update.SessionUpdate == "user_message_chunk" && !replaying) {
+				return
+			}
+			var content struct{ Type, Text string }
+			if json.Unmarshal(update.Content, &content) != nil || content.Type != "text" || content.Text == "" {
+				return
+			}
+			if (replaying || update.MessageID != "") && update.MessageID != s.replayMessage {
+				s.splitMessage = true
+				s.replayMessage = update.MessageID
+			}
+			switch update.SessionUpdate {
+			case "agent_thought_chunk":
+				s.appendMessage("reasoning", content.Text)
+			case "agent_message_chunk":
+				s.appendMessage("agent", content.Text)
+			case "user_message_chunk":
+				s.appendMessage("user", content.Text)
 			}
 		case "session_info_update":
 			if title := strings.TrimSpace(update.Title); title != "" {
@@ -388,8 +419,10 @@ func (m *sessions) update(s *session, p *acpPeer, msg rpcMessage) {
 				s.config = update.ConfigOptions
 				s.configRevision++
 			}
-		case "tool_call":
-			s.splitMessage = true
+		case "tool_call", "tool_call_update":
+			if s.remoteID != "" {
+				s.updateTool(update)
+			}
 		}
 	case "session/request_permission":
 		if msg.ID == nil {

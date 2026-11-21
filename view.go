@@ -26,6 +26,7 @@ type tabInput struct {
 	Label       string `json:"label"`
 	Placeholder string `json:"placeholder"`
 	Disabled    bool   `json:"disabled,omitempty"`
+	Stop        string `json:"stop,omitempty"`
 }
 
 type tabSelector struct {
@@ -278,9 +279,10 @@ func (v *agentsView) model() tabModel {
 		model.Selectors[1].Placement = "composer"
 	}
 	model.Chat = &tabChat{
-		Author: s.Agent, Messages: transcript(s.Messages),
+		Author: s.Agent, Messages: transcript(s.Messages, v.tabWidgets),
 	}
-	if s.Connected && s.Busy && !s.Cancelled && s.turnDone != nil {
+	canStop := s.Connected && s.Busy && !s.Cancelled && s.turnDone != nil
+	if canStop && v.tabWidgets < 5 {
 		add("cancel:"+s.ID, "Stop")
 	}
 	status := "running"
@@ -312,29 +314,70 @@ func (v *agentsView) model() tabModel {
 	if s.Connected && (v.tabWidgets >= 3 || !s.Busy && !s.Cancelled) {
 		model.Input = &tabInput{ID: "prompt:" + s.ID, Label: "Send", Placeholder: "Message",
 			Disabled: s.Busy || s.Cancelled || s.configuring}
+		if canStop && v.tabWidgets >= 5 {
+			model.Input.Stop = "cancel:" + s.ID
+		}
 	}
 	return model
 }
 
-func transcript(messages []chatMessage) []chatMessage {
+func transcript(messages []chatMessage, tabWidgets int) []chatMessage {
 	const textLimit = 8500
 	const wireLimit = 12 << 10
+	const activityTextLimit = 3600
+	const activityWireLimit = 5 << 10
 	result := []chatMessage{}
-	length, encoded := 0, 0
-	for i := len(messages) - 1; i >= 0 && length < textLimit && len(result) < 64; i-- {
+	length, encoded, activityText, activityWire, activities := 0, 0, 0, 0, 0
+	latestTurn := true
+	for i := len(messages) - 1; i >= 0 && len(result) < 64; i-- {
 		message := messages[i]
-		message.Text = tailText(displayText(message.Text, true, 256<<10), textLimit-length)
-		wire, _ := json.Marshal(message)
-		if remaining := wireLimit - encoded; len(wire)+1 > remaining {
-			// JSON can emit up to six bytes per input byte, plus the message fields.
-			if remaining < 64 {
-				break
+		if message.Role == "user" {
+			latestTurn = false
+		}
+		if message.Role == "agent" && (tabWidgets < 6 || !latestTurn) {
+			message.ID = ""
+		}
+		remainingText, remainingWire := textLimit-length, wireLimit-encoded
+		activity := message.Role == "reasoning" || message.Role == "tool"
+		if activity {
+			if tabWidgets < 4 || activities >= 24 {
+				continue
 			}
-			message.Text = tailText(message.Text, (remaining-40)/6)
+			remainingText = min(remainingText, activityTextLimit-activityText)
+			remainingWire = min(remainingWire, activityWireLimit-activityWire)
+		}
+		if remainingText < 1 || remainingWire < 1 {
+			continue
+		}
+		if message.Role == "tool" {
+			message.Text = displayText(message.Text, false, 256)
+			if len(message.Text)+len(message.Input)+len(message.Output) > remainingText {
+				message.Input, message.Output = "", ""
+			}
+		} else {
+			message.Text = tailText(displayText(message.Text, true, 256<<10), remainingText)
+		}
+		wire, _ := json.Marshal(message)
+		if len(wire)+1 > remainingWire {
+			if message.Role == "tool" {
+				message.Input, message.Output = "", ""
+			} else {
+				// Leave room for metadata and JSON's maximum escaping overhead.
+				message.Text = tailText(message.Text, max(0, (remainingWire-96)/6))
+			}
 			wire, _ = json.Marshal(message)
 		}
-		length += len(message.Text)
+		size := len(message.Text) + len(message.Input) + len(message.Output)
+		if size > remainingText || len(wire)+1 > remainingWire || message.Text == "" {
+			continue
+		}
+		length += size
 		encoded += len(wire) + 1
+		if activity {
+			activityText += size
+			activityWire += len(wire) + 1
+			activities++
+		}
 		result = append(result, message)
 	}
 	slices.Reverse(result)

@@ -80,7 +80,7 @@ func writeCED(w io.Writer, message any, maxHeader, maxBody int) error {
 	return nil
 }
 
-func validateJSON(data []byte, maxDepth int) error {
+func validateJSON(data []byte, maxDepth int, allowNULValues bool) error {
 	if !utf8.Valid(data) {
 		return errors.New("invalid UTF-8")
 	}
@@ -98,7 +98,7 @@ func validateJSON(data []byte, maxDepth int) error {
 	value = func(token json.Token, depth int) error {
 		switch item := token.(type) {
 		case string:
-			if strings.ContainsRune(item, 0) {
+			if !allowNULValues && strings.ContainsRune(item, 0) {
 				return errors.New("NUL is forbidden")
 			}
 		case json.Number:

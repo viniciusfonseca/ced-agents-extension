@@ -41,4 +41,4 @@ The [ACP Registry](https://cdn.agentclientprotocol.com/registry/v1/latest/regist
 
 ## Compatibility and tests
 
-Agents 0.4.3 requires a CED build that advertises `host.tabProtocol: 1` and `host.tabWidgets` of at least `1`. CED builds with `host.tabWidgets: 3` place both the model and effort selectors in the CUI composer. In the composer, press Enter to send and Shift+Enter for a newline. See [TESTING.md](TESTING.md) for test coverage.
+Agents 0.4.7 requires a CED build that advertises `host.tabProtocol: 1` and `host.tabWidgets` of at least `1`. Version `3` places both selectors in the CUI composer. With version `4`, the chat also shows collapsible reasoning reported by the adapter and tool calls with their status and input/output previews when available. This works during live turns and when an adapter replays saved activity. With version `5`, the composer replaces Send with Stop during a cancellable turn. Version `6` adds a typewriter effect to new agent messages. Press Enter to send and Shift+Enter for a newline. See [TESTING.md](TESTING.md) for test coverage.

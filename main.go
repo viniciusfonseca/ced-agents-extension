@@ -19,7 +19,7 @@ import (
 
 const (
 	extensionID = "viniciusfonseca.agents"
-	version     = "0.4.3"
+	version     = "0.4.7"
 	commandID   = extensionID + ".open"
 	tabID       = extensionID + ".panel"
 )
@@ -223,7 +223,7 @@ func runCED(ctx context.Context, input io.Reader, output io.Writer) error {
 		var result any
 		var failure *rpcError
 		var stop bool
-		if validateJSON(body, p.maxDepth) != nil {
+		if validateJSON(body, p.maxDepth, false) != nil {
 			failure = &rpcError{Code: -32700, Message: "Invalid CED JSON."}
 		} else if json.Unmarshal(body, &msg) != nil || msg.Version != "2.0" {
 			failure = &rpcError{Code: -32600, Message: "Invalid CED request."}

@@ -256,12 +256,20 @@ func TestAgentFixture(t *testing.T) {
 			remote = params.SessionID
 			sendUpdate(map[string]any{"sessionUpdate": "user_message_chunk", "messageId": "user",
 				"content": map[string]string{"type": "text", "text": "Old question"}})
-			// Codex can replay an image inside a tool call that the UI does not render.
-			sendUpdate(map[string]any{"sessionUpdate": "tool_call", "toolCallId": "image",
+			for _, part := range []string{"Inspect ", "the files"} {
+				sendUpdate(map[string]any{"sessionUpdate": "agent_thought_chunk", "messageId": "thought",
+					"content": map[string]string{"type": "text", "text": part}})
+			}
+			// Codex can replay tool content with images and escaped NULs.
+			sendUpdate(map[string]any{"sessionUpdate": "tool_call", "toolCallId": "image", "title": "Read files",
+				"rawInput": map[string]string{"path": "."},
 				"content": []any{map[string]any{"type": "content", "content": map[string]string{
 					"type": "image", "mimeType": "image/png", "data": strings.Repeat("A", 3<<20),
 				}}}})
-			for _, part := range []string{"Saved ", "answer"} {
+			// Replayed tool output can contain a NUL separator, e.g. from git -z.
+			sendUpdate(map[string]any{"sessionUpdate": "tool_call_update", "toolCallId": "image",
+				"status": "completed", "rawOutput": map[string]string{"stdout": "file-a\x00file-b\x00"}})
+			for _, part := range []string{"Saved\x00", "answer"} {
 				sendUpdate(map[string]any{"sessionUpdate": "agent_message_chunk", "messageId": "answer",
 					"content": map[string]string{"type": "text", "text": part}})
 			}
@@ -292,6 +300,13 @@ func TestAgentFixture(t *testing.T) {
 			reply(map[string]any{"configOptions": config()})
 		case "session/prompt":
 			promptID = msg.ID
+			if strings.Contains(string(msg.Params), "wait") {
+				sendUpdate(map[string]any{"sessionUpdate": "tool_call", "toolCallId": "live",
+					"title": "Check files", "status": "in_progress"})
+				sendUpdate(map[string]any{"sessionUpdate": "agent_thought_chunk",
+					"content": map[string]string{"type": "text", "text": "Checking the results"}})
+				continue
+			}
 			sendUpdate(map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]string{"type": "text", "text": "Olá "}})
 			if strings.Contains(string(msg.Params), "permission") {
 				write(map[string]any{"id": "permission-1", "method": "session/request_permission", "params": map[string]any{
@@ -308,6 +323,8 @@ func TestAgentFixture(t *testing.T) {
 				reply(map[string]string{"stopReason": "end_turn"})
 			}
 		case "session/cancel":
+			sendUpdate(map[string]any{"sessionUpdate": "tool_call_update", "toolCallId": "live", "status": "failed",
+				"content": []any{map[string]any{"type": "content", "content": map[string]string{"type": "text", "text": "Cancelled"}}}})
 			write(map[string]any{"id": promptID, "result": map[string]string{"stopReason": "cancelled"}})
 		case "":
 			if string(msg.ID) != "\"permission-1\"" || !strings.Contains(string(msg.Result), "\"optionId\":\"allow\"") {
@@ -460,9 +477,16 @@ func TestPackagedEndToEnd(t *testing.T) {
 			t.Fatalf("Wrong session: %+v", model)
 		}
 		tab.action(t, prompt, "wait", 0)
+		model = tab.wait(t, func(m tabModel) bool { return m.Refresh && m.Input == nil })
+		if len(model.Actions) < 2 || model.Actions[1].ID != "cancel:"+id {
+			t.Fatalf("Missing legacy Stop action: %+v", model.Actions)
+		}
 		tab.action(t, prompt, "parallel", -32010)
 		tab.action(t, "cancel:"+id, "", 0)
-		tab.wait(t, func(m tabModel) bool { return m.Input != nil })
+		model = tab.wait(t, func(m tabModel) bool { return m.Input != nil })
+		if hasMessage(model, "Check files") || hasMessage(model, "Checking the results") {
+			t.Fatal("Host with tab widgets v1 received activity entries")
+		}
 		tab.action(t, prompt, "permission", 0)
 		var permission string
 		tab.wait(t, func(m tabModel) bool {
@@ -507,7 +531,7 @@ func TestMachineSessionHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	init := initialization(root)
-	init["host"].(map[string]any)["tabWidgets"] = 3
+	init["host"].(map[string]any)["tabWidgets"] = 6
 	r.send(t, request(1, "ced/initialize", init))
 	r.expect(t, 1, 0)
 	r.send(t, request(2, "ced/activate", withContext("reason", map[string]string{"event": "onCommand:" + commandID})))
@@ -534,8 +558,13 @@ func TestMachineSessionHistory(t *testing.T) {
 	tab.action(t, "harness", "codex", 0)
 	tab.action(t, other, "", 0)
 	model = tab.wait(t, func(m tabModel) bool { return m.Input != nil })
-	if len(model.Chat.Messages) != 2 || model.Chat.Messages[0] != (chatMessage{"user", "Old question"}) ||
-		model.Chat.Messages[1] != (chatMessage{"agent", "Saved answer"}) || model.Selectors[0].Selected != "standard" || (model.Selectors[0].Placement != "composer" || model.Selectors[1].Placement != "composer") {
+	messages := model.Chat.Messages
+	if len(messages) != 4 || messages[0] != (chatMessage{Role: "user", Text: "Old question"}) ||
+		messages[1].Role != "reasoning" || messages[1].ID == "" || messages[1].Status != "" || messages[1].Text != "Inspect the files" ||
+		messages[2].Role != "tool" || messages[2].ID == "" || messages[2].Status != "done" || messages[2].Text != "Read files" ||
+		messages[2].Input != `{"path":"."}` || !strings.Contains(messages[2].Output, `"stdout":"file-a\u0000file-b\u0000"`) ||
+		messages[3] != (chatMessage{Role: "agent", Text: "Saved answer"}) || model.Selectors[0].Selected != "standard" ||
+		model.Selectors[0].Placement != "composer" || model.Selectors[1].Placement != "composer" {
 		t.Fatalf("Replayed conversation did not load: %+v", model.Chat)
 	}
 	prompt := model.Input.ID
@@ -547,15 +576,45 @@ func TestMachineSessionHistory(t *testing.T) {
 		t.Fatalf("Configuration change replaced the composer: %+v", model.Input)
 	}
 	tab.action(t, prompt, "wait", 0)
-	model = tab.wait(t, func(m tabModel) bool { return hasMessage(m, "wait") })
+	model = tab.wait(t, func(m tabModel) bool { return hasMessage(m, "Checking the results") })
+	messages = model.Chat.Messages
+	tool, thought := messages[len(messages)-2], messages[len(messages)-1]
+	if tool.Role != "tool" || tool.Status != "running" || thought.Role != "reasoning" || thought.Status != "running" {
+		t.Fatalf("Missing running activity: %+v", messages)
+	}
 	if model.Input == nil || !model.Input.Disabled || model.Input.ID != prompt ||
 		model.Selectors[0].Selected != "advanced" || model.Selectors[1].Selected != "high" {
 		t.Fatalf("Busy chat lost its composer or selected configuration: %+v", model)
 	}
-	tab.action(t, "cancel:"+strings.TrimPrefix(prompt, "prompt:"), "", 0)
-	tab.wait(t, func(m tabModel) bool { return m.Input != nil && !m.Input.Disabled })
+	if model.Input.Stop != "cancel:"+strings.TrimPrefix(prompt, "prompt:") {
+		t.Fatalf("Missing composer stop action: %+v", model.Input)
+	}
+	for _, action := range model.Actions {
+		if action.ID == model.Input.Stop {
+			t.Fatal("Composer stop action was also listed in the header")
+		}
+	}
+	tab.action(t, model.Input.Stop, "", 0)
+	model = tab.wait(t, func(m tabModel) bool { return m.Input != nil && !m.Input.Disabled })
+	if model.Input.Stop != "" {
+		t.Fatal("Composer kept stop action after cancellation")
+	}
+	messages = model.Chat.Messages
+	updatedTool, updatedThought := messages[len(messages)-2], messages[len(messages)-1]
+	if updatedTool.ID != tool.ID || updatedTool.Status != "failed" || updatedTool.Output != "Cancelled" ||
+		updatedThought.ID != thought.ID || updatedThought.Status != "" {
+		t.Fatalf("Activity was not updated in place: %+v", messages)
+	}
 	tab.action(t, prompt, "Follow-up", 0)
-	tab.wait(t, func(m tabModel) bool { return m.Input != nil && !m.Input.Disabled && hasMessage(m, "Olá mundo 🙂") })
+	model = tab.wait(t, func(m tabModel) bool { return m.Input != nil && !m.Input.Disabled && hasMessage(m, "Olá mundo 🙂") })
+	last := model.Chat.Messages[len(model.Chat.Messages)-1]
+	if last.Role != "agent" || last.ID == "" {
+		t.Fatalf("Live reply has no typewriter ID: %+v", last)
+	}
+	refreshed := tab.action(t, "refresh", "", 0)
+	if refreshed.Chat.Messages[len(refreshed.Chat.Messages)-1].ID != last.ID {
+		t.Fatal("Live reply changed ID on refresh")
+	}
 	model = tab.action(t, "back", "", 0)
 	if len(model.Actions) != 31 || !strings.HasPrefix(model.Actions[2].ID, "session:") {
 		t.Fatalf("Saved session was duplicated or not given its active connection: %+v", model.Actions)
@@ -575,6 +634,8 @@ func TestACPReadFixture(t *testing.T) {
 		fmt.Fprintln(os.Stdout, strings.Repeat("a", maxACPMessageBytes+3))
 	case "invalid":
 		fmt.Fprintln(os.Stdout, "{invalid}")
+	case "raw-nul":
+		fmt.Fprintln(os.Stdout, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"text\":\"a\x00b\"}}")
 	default:
 		os.Exit(2)
 	}
@@ -585,6 +646,7 @@ func TestACPReadErrors(t *testing.T) {
 	for mode, want := range map[string]string{
 		"oversized": "larger than 16 MiB",
 		"invalid":   "invalid JSON-RPC",
+		"raw-nul":   "invalid JSON-RPC",
 	} {
 		t.Run(mode, func(t *testing.T) {
 			executable, err := os.Executable()
@@ -628,7 +690,7 @@ func TestCEDFraming(t *testing.T) {
 		}
 	}
 	for _, body := range []string{`{"a":1,"a":2}`, `{"a":"\u0000"}`, "{\"a\":\"\xff\"}", `{"a":1e9999}`, `{"a":}`, `{} {}`, strings.Repeat("[", 65) + "0" + strings.Repeat("]", 65)} {
-		if validateJSON([]byte(body), 64) == nil {
+		if validateJSON([]byte(body), 64, false) == nil {
 			t.Fatalf("Accepted malformed JSON: %q", body)
 		}
 	}
