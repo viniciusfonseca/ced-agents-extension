@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"slices"
@@ -25,15 +26,16 @@ type historyEntry struct {
 }
 
 type sessionHistory struct {
-	loading bool
-	err     error
-	entries []historyEntry
+	loading  bool
+	deleting bool
+	err      error
+	entries  []historyEntry
 }
 
 func (m *sessions) refreshHistory(agent provider, force bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if current := m.history[agent.ID]; current != nil && (current.loading || !force) {
+	if current := m.history[agent.ID]; current != nil && (current.loading || current.deleting || !force) {
 		return
 	}
 	current := &sessionHistory{loading: true}
@@ -57,10 +59,10 @@ func (m *sessions) refreshHistory(agent provider, force bool) {
 	}()
 }
 
-func (m *sessions) listHistory(agent provider) ([]historyEntry, error) {
+func (m *sessions) historyPeer(ctx context.Context, agent provider) (*acpPeer, acpInitialization, error) {
 	cmd, err := m.command(agent)
 	if err != nil {
-		return nil, err
+		return nil, acpInitialization{}, err
 	}
 	p, err := startACP(cmd, m.root, func(p *acpPeer, msg rpcMessage) {
 		if msg.ID != nil {
@@ -68,15 +70,25 @@ func (m *sessions) listHistory(agent provider) ([]historyEntry, error) {
 		}
 	})
 	if err != nil {
+		return nil, acpInitialization{}, err
+	}
+	init, err := initializeACP(ctx, p)
+	if err != nil {
+		p.stop()
+		<-p.done
+		return nil, init, err
+	}
+	return p, init, nil
+}
+
+func (m *sessions) listHistory(agent provider) ([]historyEntry, error) {
+	ctx, cancel := context.WithTimeout(m.ctx, 45*time.Second)
+	defer cancel()
+	p, _, err := m.historyPeer(ctx, agent)
+	if err != nil {
 		return nil, err
 	}
 	defer func() { p.stop(); <-p.done }()
-
-	ctx, cancel := context.WithTimeout(m.ctx, 45*time.Second)
-	defer cancel()
-	if _, err := initializeACP(ctx, p); err != nil {
-		return nil, err
-	}
 
 	var entries []historyEntry
 	params := map[string]string{}
@@ -100,6 +112,7 @@ func (m *sessions) listHistory(agent provider) ([]historyEntry, error) {
 				continue
 			}
 			seen[item.SessionID] = true
+			item.Cwd = filepath.Clean(item.Cwd)
 			related, known := local[item.Cwd]
 			if !known {
 				related = workspaceSession(m.root, item.Cwd)
@@ -170,4 +183,149 @@ func (v *agentsView) historyRows() []historyEntry {
 		return b.UpdatedAt.Compare(a.UpdatedAt)
 	})
 	return entries
+}
+
+func groupAction(cwd string) string {
+	digest := sha256.Sum256([]byte(cwd))
+	return "new-directory:" + hex.EncodeToString(digest[:])
+}
+
+// Keep directories together on consecutive pages while retaining the order of
+// their first appearance and the existing order of sessions within a directory.
+func groupHistoryRows(rows []historyEntry) []historyEntry {
+	var directories []string
+	byDirectory := make(map[string][]historyEntry)
+	for _, row := range rows {
+		if byDirectory[row.Cwd] == nil {
+			directories = append(directories, row.Cwd)
+		}
+		byDirectory[row.Cwd] = append(byDirectory[row.Cwd], row)
+	}
+	grouped := make([]historyEntry, 0, len(rows))
+	for _, cwd := range directories {
+		grouped = append(grouped, byDirectory[cwd]...)
+	}
+	return grouped
+}
+
+func sessionListLabel(text string, limit int) string {
+	text = displayText(text, false, limit)
+	// Bound JSON escaping so a page with 28 different directories fits the host limit.
+	if wire, _ := json.Marshal(text); len(wire) > 900 {
+		return boundedText(text, 149) + "…"
+	}
+	return text
+}
+
+func sessionGroup(cwd string) tabSessionGroup {
+	return tabSessionGroup{Label: sessionListLabel(cwd, 1024), Create: groupAction(cwd), Items: []tabSessionItem{}}
+}
+
+func sessionGroups(rows []historyEntry) []tabSessionGroup {
+	var groups []tabSessionGroup
+	for i, row := range rows {
+		if i == 0 || rows[i-1].Cwd != row.Cwd {
+			groups = append(groups, sessionGroup(row.Cwd))
+		}
+		group := &groups[len(groups)-1]
+		group.Items = append(group.Items, tabSessionItem{
+			ID: row.action, Label: sessionListLabel(row.Title, 256), Delete: "delete:" + row.action,
+		})
+	}
+	return groups
+}
+
+func (m *sessions) deleteSession(agent provider, action string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	history := m.history[agent.ID]
+	if history != nil && (history.loading || history.deleting) {
+		return errors.New("Wait for session history to finish updating.")
+	}
+	command, arg, _ := strings.Cut(action, ":")
+	var remote string
+	var live *session
+	if command == "session" {
+		for _, item := range m.items {
+			if item.providerID == agent.ID && item.ID == arg {
+				live, remote = item, item.remoteID
+				break
+			}
+		}
+		if live == nil {
+			return errors.New("Session unavailable.")
+		}
+	} else if command == "history" && history != nil {
+		for _, entry := range history.entries {
+			if entry.action == action {
+				remote = entry.SessionID
+				break
+			}
+		}
+		if remote == "" {
+			return errors.New("Session unavailable.")
+		}
+	} else {
+		return errors.New("Session unavailable.")
+	}
+	matches := func(item *session) bool {
+		return item == live || (remote != "" && item.providerID == agent.ID &&
+			(item.remoteID == remote || item.savedID == remote))
+	}
+	for _, item := range m.items {
+		if matches(item) && (item.Busy || item.Cancelled || item.configuring) {
+			return errors.New("Wait for the session to finish working before deleting it.")
+		}
+	}
+	removeLive := func(item *session) bool {
+		if !matches(item) {
+			return false
+		}
+		if item.peer != nil {
+			item.peer.stop()
+		}
+		return true
+	}
+	if remote == "" {
+		m.items = slices.DeleteFunc(m.items, removeLive)
+		return nil
+	}
+	if history == nil {
+		history = &sessionHistory{}
+		if m.history == nil {
+			m.history = make(map[string]*sessionHistory)
+		}
+		m.history[agent.ID] = history
+	}
+	history.deleting, history.err = true, nil
+	m.jobs.Add(1)
+	go func() {
+		defer m.jobs.Done()
+		err := m.deleteRemoteSession(agent, remote)
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		history.deleting, history.err = false, err
+		if err == nil {
+			m.items = slices.DeleteFunc(m.items, removeLive)
+			history.entries = slices.DeleteFunc(history.entries, func(entry historyEntry) bool {
+				return entry.SessionID == remote
+			})
+		}
+	}()
+	return nil
+}
+
+func (m *sessions) deleteRemoteSession(agent provider, id string) error {
+	ctx, cancel := context.WithTimeout(m.ctx, 45*time.Second)
+	defer cancel()
+	p, init, err := m.historyPeer(ctx, agent)
+	if err != nil {
+		return err
+	}
+	defer func() { p.stop(); <-p.done }()
+	if init.AgentCapabilities.SessionCapabilities.Delete == nil {
+		return errors.New("This ACP adapter does not support deleting saved sessions.")
+	}
+	var result struct{}
+	return p.exchange(ctx, "session/delete", map[string]string{"sessionId": id}, &result, nil)
 }

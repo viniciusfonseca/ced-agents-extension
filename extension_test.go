@@ -218,7 +218,17 @@ func TestAgentFixture(t *testing.T) {
 		reply := func(result any) { write(map[string]any{"id": msg.ID, "result": result}) }
 		switch msg.Method {
 		case "initialize":
-			reply(map[string]any{"protocolVersion": 1, "agentCapabilities": map[string]bool{"loadSession": true}})
+			capabilities := map[string]any{"loadSession": true}
+			if agent == "codex" {
+				capabilities["sessionCapabilities"] = map[string]any{"delete": struct{}{}}
+			}
+			reply(map[string]any{"protocolVersion": 1, "agentCapabilities": capabilities})
+		case "session/delete":
+			var params struct{ SessionID string }
+			if json.Unmarshal(msg.Params, &params) != nil || agent != "codex" || params.SessionID != "codex-saved" {
+				os.Exit(2)
+			}
+			reply(struct{}{})
 		case "session/list":
 			var params struct{ Cursor, Cwd string }
 			if json.Unmarshal(msg.Params, &params) != nil || params.Cwd != "" {
@@ -279,7 +289,7 @@ func TestAgentFixture(t *testing.T) {
 				Cwd        string
 				MCPServers []any
 			}
-			if json.Unmarshal(msg.Params, &params) != nil || params.Cwd != root || params.MCPServers == nil {
+			if json.Unmarshal(msg.Params, &params) != nil || (params.Cwd != root && params.Cwd != filepath.Join(root, "nested")) || params.MCPServers == nil {
 				os.Exit(2)
 			}
 			reply(map[string]any{"sessionId": remote, "configOptions": config()})
@@ -531,7 +541,7 @@ func TestMachineSessionHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	init := initialization(root)
-	init["host"].(map[string]any)["tabWidgets"] = 6
+	init["host"].(map[string]any)["tabWidgets"] = 7
 	r.send(t, request(1, "ced/initialize", init))
 	r.expect(t, 1, 0)
 	r.send(t, request(2, "ced/activate", withContext("reason", map[string]string{"event": "onCommand:" + commandID})))
@@ -577,6 +587,9 @@ func TestMachineSessionHistory(t *testing.T) {
 	}
 	tab.action(t, prompt, "wait", 0)
 	model = tab.wait(t, func(m tabModel) bool { return hasMessage(m, "Checking the results") })
+	if model.Text != "Working..." {
+		t.Fatalf("Unexpected busy label: %q", model.Text)
+	}
 	messages = model.Chat.Messages
 	tool, thought := messages[len(messages)-2], messages[len(messages)-1]
 	if tool.Role != "tool" || tool.Status != "running" || thought.Role != "reasoning" || thought.Status != "running" {
@@ -615,9 +628,68 @@ func TestMachineSessionHistory(t *testing.T) {
 	if refreshed.Chat.Messages[len(refreshed.Chat.Messages)-1].ID != last.ID {
 		t.Fatal("Live reply changed ID on refresh")
 	}
-	model = tab.action(t, "back", "", 0)
-	if len(model.Actions) != 31 || !strings.HasPrefix(model.Actions[2].ID, "session:") {
+	if refreshed.Chat.Back != "back" {
+		t.Fatalf("Missing chat back action: %+v", refreshed.Chat)
+	}
+	for _, action := range refreshed.Actions {
+		if action.ID == refreshed.Chat.Back {
+			t.Fatal("Back action was also listed in the header")
+		}
+	}
+	model = tab.action(t, refreshed.Chat.Back, "", 0)
+	if model.Chat != nil || len(model.Actions) != 31 || !strings.HasPrefix(model.Actions[2].ID, "session:") {
 		t.Fatalf("Saved session was duplicated or not given its active connection: %+v", model.Actions)
+	}
+}
+
+func TestGroupedSessionActions(t *testing.T) {
+	r := launch(t)
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	nested := filepath.Join(root, "nested")
+	init := initialization(root)
+	init["host"].(map[string]any)["tabWidgets"] = 8
+	r.send(t, request(1, "ced/initialize", init))
+	r.expect(t, 1, 0)
+	r.send(t, request(2, "ced/activate", withContext("reason", map[string]string{"event": "onCommand:" + commandID})))
+	r.expect(t, 2, 0)
+	tab := tabClient{r, 2}
+	tab.action(t, "open", "", 0)
+	model := tab.wait(t, func(m tabModel) bool { return !m.Refresh })
+	if len(model.Groups) != 3 || model.Groups[0].Label != nested || model.Groups[1].Label != root ||
+		model.Groups[2].Label != root+"-other" || len(model.Groups[2].Items) != 26 {
+		t.Fatalf("Wrong directory groups: %+v", model.Groups)
+	}
+	remove := model.Groups[1].Items[0].Delete
+	model = tab.action(t, remove, "", 0)
+	if len(model.Actions) != 2 || model.Actions[0].ID != "confirm-delete" || !strings.Contains(model.Text, "Saved codex") {
+		t.Fatalf("Expected confirmation naming the session: %+v", model)
+	}
+	model = tab.action(t, "cancel-delete", "", 0)
+	if len(model.Groups[1].Items) != 1 {
+		t.Fatal("Cancel removed the session")
+	}
+	tab.action(t, remove, "", 0)
+	tab.action(t, "confirm-delete", "", 0)
+	model = tab.wait(t, func(m tabModel) bool { return !m.Refresh })
+	if len(model.Groups) != 3 || model.Groups[0].Label != root || len(model.Groups[0].Items) != 0 {
+		t.Fatalf("Deleted session is still in the history: %+v", model)
+	}
+	tab.action(t, model.Groups[1].Create, "", 0)
+	model = tab.wait(t, func(m tabModel) bool { return !m.Refresh })
+	if model.Input == nil || !strings.HasSuffix(model.Heading, nested) {
+		t.Fatalf("New session did not start in the selected directory: %+v", model)
+	}
+	tab.action(t, "back", "", 0)
+	tab.action(t, "harness", "claude", 0)
+	model = tab.wait(t, func(m tabModel) bool { return !m.Refresh })
+	tab.action(t, model.Groups[1].Items[0].Delete, "", 0)
+	tab.action(t, "confirm-delete", "", 0)
+	model = tab.wait(t, func(m tabModel) bool { return !m.Refresh })
+	if !strings.Contains(model.Text, "does not support deleting") || len(model.Groups[1].Items) != 1 {
+		t.Fatalf("Unsupported deletion should keep the session and report the adapter error: %+v", model)
 	}
 }
 

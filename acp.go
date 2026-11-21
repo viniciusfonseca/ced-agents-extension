@@ -103,7 +103,10 @@ func startACP(cmd *exec.Cmd, root string, onMessage func(*acpPeer, rpcMessage)) 
 type acpInitialization struct {
 	ProtocolVersion   int
 	AgentCapabilities struct {
-		LoadSession bool
+		LoadSession         bool
+		SessionCapabilities struct {
+			Delete *struct{}
+		}
 	}
 }
 

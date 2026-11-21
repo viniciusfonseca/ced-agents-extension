@@ -41,26 +41,41 @@ type tabSelector struct {
 type tabChat struct {
 	Author   string        `json:"author"`
 	Status   string        `json:"status,omitempty"`
+	Back     string        `json:"back,omitempty"`
 	Messages []chatMessage `json:"messages"`
 }
 
+type tabSessionGroup struct {
+	Label  string           `json:"label"`
+	Create string           `json:"create"`
+	Items  []tabSessionItem `json:"items"`
+}
+
+type tabSessionItem struct {
+	ID     string `json:"id"`
+	Label  string `json:"label"`
+	Delete string `json:"delete"`
+}
+
 type tabModel struct {
-	Heading   string        `json:"heading"`
-	Text      string        `json:"text"`
-	Actions   []tabAction   `json:"actions"`
-	Input     *tabInput     `json:"input,omitempty"`
-	Selectors []tabSelector `json:"selectors,omitempty"`
-	Chat      *tabChat      `json:"chat,omitempty"`
-	Refresh   bool          `json:"refresh,omitempty"`
+	Heading   string            `json:"heading"`
+	Text      string            `json:"text"`
+	Actions   []tabAction       `json:"actions"`
+	Input     *tabInput         `json:"input,omitempty"`
+	Selectors []tabSelector     `json:"selectors,omitempty"`
+	Chat      *tabChat          `json:"chat,omitempty"`
+	Refresh   bool              `json:"refresh,omitempty"`
+	Groups    []tabSessionGroup `json:"groups,omitempty"`
 }
 
 type agentsView struct {
-	sessions   sessions
-	selected   string
-	harness    string
-	page       int
-	tabWidgets int
-	cancel     context.CancelFunc
+	sessions      sessions
+	selected      string
+	harness       string
+	page          int
+	tabWidgets    int
+	cancel        context.CancelFunc
+	confirmDelete string
 }
 
 func startView(parent context.Context, workspace string, tabWidgets int) *agentsView {
@@ -84,6 +99,16 @@ func (v *agentsView) findSession(id string) *session {
 
 func (v *agentsView) handle(event tabEvent) error {
 	command, arg, _ := strings.Cut(event.Action, ":")
+	if v.confirmDelete != "" && command != "refresh" {
+		target := v.confirmDelete
+		v.confirmDelete = ""
+		switch command {
+		case "confirm-delete":
+			return v.sessions.deleteSession(v.currentHarness(), target)
+		case "cancel-delete":
+			return nil
+		}
+	}
 	switch command {
 	case "open":
 		v.sessions.refreshHistory(v.currentHarness(), false)
@@ -110,19 +135,46 @@ func (v *agentsView) handle(event tabEvent) error {
 			return nil
 		}
 		return errors.New("Choose an available harness.")
-	case "new":
-		if v.selected == "" {
-			for _, agent := range providers {
-				if agent.ID == v.harness && arg == v.harness {
-					id, err := v.sessions.create(agent, nil)
-					if err == nil {
-						v.selected = id
-					}
-					return err
+	case "delete":
+		v.sessions.mu.Lock()
+		defer v.sessions.mu.Unlock()
+		if v.selected == "" && v.tabWidgets >= 8 {
+			for _, row := range v.historyRows() {
+				if row.action == arg {
+					v.confirmDelete = arg
+					return nil
 				}
 			}
 		}
-		return errors.New("Choose an available agent from the session list.")
+		return errors.New("Session unavailable.")
+	case "new", "new-directory":
+		if v.selected != "" {
+			return errors.New("Choose an available agent from the session list.")
+		}
+		cwd := v.sessions.root
+		if command == "new-directory" {
+			v.sessions.mu.Lock()
+			if groupAction(cwd) != event.Action {
+				cwd = ""
+				for _, row := range v.historyRows() {
+					if groupAction(row.Cwd) == event.Action {
+						cwd = row.Cwd
+						break
+					}
+				}
+			}
+			v.sessions.mu.Unlock()
+		} else if arg != v.harness {
+			cwd = ""
+		}
+		if cwd == "" {
+			return errors.New("Session directory unavailable.")
+		}
+		id, err := v.sessions.create(v.currentHarness(), cwd, nil)
+		if err == nil {
+			v.selected = id
+		}
+		return err
 	case "history":
 		if v.selected == "" {
 			v.sessions.mu.Lock()
@@ -138,7 +190,7 @@ func (v *agentsView) handle(event tabEvent) error {
 			}
 			v.sessions.mu.Unlock()
 			if saved != nil {
-				id, err := v.sessions.create(v.currentHarness(), saved)
+				id, err := v.sessions.create(v.currentHarness(), saved.Cwd, saved)
 				if err == nil {
 					v.selected = id
 				}
@@ -229,17 +281,43 @@ func (v *agentsView) model() tabModel {
 		for _, agent := range providers {
 			harness.Options = append(harness.Options, tabAction{ID: agent.ID, Label: agent.Name})
 		}
+		if v.confirmDelete != "" {
+			for _, row := range v.historyRows() {
+				if row.action == v.confirmDelete {
+					model.Text = "Delete session “" + displayText(row.Title, false, 256) + "”? The adapter will remove it from its session history."
+					add("confirm-delete", "Delete Session")
+					add("cancel-delete", "Cancel")
+					return model
+				}
+			}
+			v.confirmDelete = ""
+		}
+		if history := v.sessions.history[v.harness]; history != nil && history.deleting {
+			model.Text, model.Refresh = "Deleting session…", true
+			return model
+		}
 		model.Selectors = []tabSelector{harness}
 		rows := v.historyRows()
+		if v.tabWidgets >= 8 {
+			rows = groupHistoryRows(rows)
+		}
 		lastPage := max(0, (len(rows)-1)/sessionPageSize)
 		v.page = min(v.page, lastPage)
 		start := v.page * sessionPageSize
-		for _, row := range rows[start:min(start+sessionPageSize, len(rows))] {
-			label := row.Title
-			if row.Cwd != v.sessions.root {
-				label = boundedText(label, 125) + " · " + row.Cwd
+		pageRows := rows[start:min(start+sessionPageSize, len(rows))]
+		if v.tabWidgets >= 8 {
+			model.Groups = sessionGroups(pageRows)
+			if v.page == 0 && !slices.ContainsFunc(rows, func(row historyEntry) bool { return row.Cwd == v.sessions.root }) {
+				model.Groups = append([]tabSessionGroup{sessionGroup(v.sessions.root)}, model.Groups...)
 			}
-			add(row.action, label)
+		} else {
+			for _, row := range pageRows {
+				label := row.Title
+				if row.Cwd != v.sessions.root {
+					label = boundedText(label, 125) + " · " + row.Cwd
+				}
+				add(row.action, label)
+			}
 		}
 		if v.page > 0 {
 			add("history-page:"+strconv.Itoa(v.page-1), "Previous Page")
@@ -247,7 +325,9 @@ func (v *agentsView) model() tabModel {
 		if v.page < lastPage {
 			add("history-page:"+strconv.Itoa(v.page+1), "Next Page")
 		}
-		add("new:"+v.harness, "New Session")
+		if v.tabWidgets < 8 {
+			add("new:"+v.harness, "New Session")
+		}
 		if history := v.sessions.history[v.harness]; history != nil {
 			model.Refresh = history.loading
 			switch {
@@ -269,7 +349,6 @@ func (v *agentsView) model() tabModel {
 		title += " · " + s.cwd
 	}
 	model.Heading = displayText(title, false, 256)
-	add("back", "Sessions")
 	model.Refresh = s.Busy || s.Cancelled || s.configuring
 	model.Selectors = []tabSelector{s.selector("model", "Model"), s.selector("thought_level", "Effort")}
 	if v.tabWidgets >= 2 {
@@ -280,6 +359,11 @@ func (v *agentsView) model() tabModel {
 	}
 	model.Chat = &tabChat{
 		Author: s.Agent, Messages: transcript(s.Messages, v.tabWidgets),
+	}
+	if v.tabWidgets >= 7 {
+		model.Chat.Back = "back"
+	} else {
+		add("back", "Sessions")
 	}
 	canStop := s.Connected && s.Busy && !s.Cancelled && s.turnDone != nil
 	if canStop && v.tabWidgets < 5 {
@@ -296,7 +380,7 @@ func (v *agentsView) model() tabModel {
 	case s.Busy && !s.Connected:
 		model.Text = "Connecting…"
 	case s.Busy:
-		model.Text = "Waiting for response…"
+		model.Text = "Working..."
 	case s.configuring:
 		model.Text = "Updating session…"
 	}

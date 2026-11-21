@@ -132,7 +132,7 @@ type sessions struct {
 	history map[string]*sessionHistory
 }
 
-func (m *sessions) create(agent provider, saved *historyEntry) (string, error) {
+func (m *sessions) create(agent provider, cwd string, saved *historyEntry) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.ctx.Err() != nil {
@@ -164,7 +164,7 @@ func (m *sessions) create(agent provider, saved *historyEntry) (string, error) {
 	}
 	m.nextID++
 	s := &session{ID: strconv.FormatUint(m.nextID, 10), Title: "New session", Agent: agent.Name, providerID: agent.ID,
-		cwd: m.root, local: true, updatedAt: time.Now(), Busy: true, Revision: 1}
+		cwd: cwd, local: workspaceSession(m.root, cwd), updatedAt: time.Now(), Busy: true, Revision: 1}
 	if saved != nil {
 		s.Title, s.cwd, s.local = boundedText(saved.Title, 100), saved.Cwd, saved.local
 		s.savedID, s.updatedAt = saved.SessionID, saved.UpdatedAt

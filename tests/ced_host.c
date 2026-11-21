@@ -70,6 +70,10 @@ int main(int argc, char **argv) {
     cJSON *model = host->instances[0].tabs[0].model;
     assert(!strcmp(ced_ext_json_string(cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(model, "selectors"), 0),
                                       "selected"), "codex"));
+    const cJSON *group = cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(model, "groups"), 0);
+    assert(!strcmp(ced_ext_json_string(group, "label"), root));
+    assert(cJSON_IsArray(cJSON_GetObjectItemCaseSensitive(group, "items")));
+    assert(!strncmp(ced_ext_json_string(group, "create"), "new-directory:", 14));
     assert(ced_extensions_tab_action(&host->instances[0], 0, "harness", "claude"));
     deadline = ced_ext_now() + 8;
     while (*host->instances[0].command) tick(host, deadline);
