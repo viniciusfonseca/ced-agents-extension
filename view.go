@@ -38,7 +38,13 @@ type tabSelector struct {
 	Placement string      `json:"placement,omitempty"`
 }
 
+type tabApproval struct {
+	Title   string      `json:"title"`
+	Actions []tabAction `json:"actions"`
+}
+
 type tabChat struct {
+	Approval *tabApproval  `json:"approval,omitempty"`
 	Author   string        `json:"author"`
 	Status   string        `json:"status,omitempty"`
 	Back     string        `json:"back,omitempty"`
@@ -230,22 +236,13 @@ func (v *agentsView) handle(event tabEvent) error {
 			break
 		}
 		if choice == "deny" {
-			return v.sessions.choose(s, request, "")
+			return v.sessions.choose(s, request, -1)
 		}
 		index, err := strconv.Atoi(choice)
 		if err != nil || index < 0 {
 			break
 		}
-		v.sessions.mu.Lock()
-		prompt := s.Permission
-		option := ""
-		if prompt != nil && prompt.ID == request && index < len(prompt.Options) {
-			option = prompt.Options[index].ID
-		}
-		v.sessions.mu.Unlock()
-		if option != "" {
-			return v.sessions.choose(s, request, option)
-		}
+		return v.sessions.choose(s, request, index)
 	}
 	return errors.New("That action is no longer available.")
 }
@@ -357,6 +354,11 @@ func (v *agentsView) model() tabModel {
 	if v.tabWidgets >= 3 {
 		model.Selectors[1].Placement = "composer"
 	}
+	if v.tabWidgets >= 9 {
+		approval := s.selector("mode", "Approval Mode")
+		approval.Placement = "composer"
+		model.Selectors = append(model.Selectors, approval)
+	}
 	model.Chat = &tabChat{
 		Author: s.Agent, Messages: transcript(s.Messages, v.tabWidgets),
 	}
@@ -369,14 +371,17 @@ func (v *agentsView) model() tabModel {
 	if canStop && v.tabWidgets < 5 {
 		add("cancel:"+s.ID, "Stop")
 	}
+	permission := s.permission()
 	status := "running"
 	switch {
 	case s.Error != "":
 		model.Text, status = s.Error, "failed"
 	case s.Cancelled:
 		model.Text = "Stopping…"
-	case s.Permission != nil:
-		model.Text, status = s.Permission.Title, "pending"
+	case permission != nil:
+		if v.tabWidgets < 9 {
+			model.Text, status = permission.Title, "pending"
+		}
 	case s.Busy && !s.Connected:
 		model.Text = "Connecting…"
 	case s.Busy:
@@ -388,12 +393,28 @@ func (v *agentsView) model() tabModel {
 		model.Text = displayText(model.Text, true, 1024)
 		model.Chat.Status = status
 	}
-	if permission := s.Permission; permission != nil {
+	if permission != nil {
 		prefix := "permission:" + s.ID + ":" + permission.ID + ":"
+		actions := make([]tabAction, 0, len(permission.Options)+1)
 		for i, option := range permission.Options {
-			add(prefix+strconv.Itoa(i), option.Name)
+			if v.tabWidgets >= 9 || option.Kind == "allow_once" || option.Kind == "reject_once" {
+				actions = append(actions, tabAction{prefix + strconv.Itoa(i), option.Name})
+			}
 		}
-		add(prefix+"deny", "Cancel Permission Request")
+		cancel := "Cancel Request"
+		if v.tabWidgets < 9 {
+			cancel = "Cancel Permission Request"
+		}
+		actions = append(actions, tabAction{prefix + "deny", cancel})
+		if v.tabWidgets >= 9 {
+			title := "Approval required"
+			if tool := strings.TrimSpace(displayText(permission.Title, false, 256)); tool != "" {
+				title += " · " + tool
+			}
+			model.Chat.Approval = &tabApproval{Title: title, Actions: actions}
+		} else {
+			model.Actions = append(model.Actions, actions...)
+		}
 	}
 	if s.Connected && (v.tabWidgets >= 3 || !s.Busy && !s.Cancelled) {
 		model.Input = &tabInput{ID: "prompt:" + s.ID, Label: "Send", Placeholder: "Message",
@@ -500,7 +521,10 @@ func (s *session) selector(category, label string) tabSelector {
 		choices[0] = current
 	}
 	const maxChoices = 256
-	const maxOptionBytes = 16 << 10
+	maxOptionBytes := 16 << 10
+	if category == "mode" {
+		maxOptionBytes = 8 << 10
+	}
 	size := 0
 	seen := make(map[string]bool)
 	for _, choice := range choices {

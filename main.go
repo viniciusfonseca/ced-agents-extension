@@ -19,7 +19,7 @@ import (
 
 const (
 	extensionID = "viniciusfonseca.agents"
-	version     = "0.4.10"
+	version     = "0.4.11"
 	commandID   = extensionID + ".open"
 	tabID       = extensionID + ".panel"
 )

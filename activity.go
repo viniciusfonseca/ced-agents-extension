@@ -8,6 +8,7 @@ import (
 )
 
 type sessionUpdate struct {
+	CurrentModeID string
 	configResponse
 	SessionUpdate, Title, Name, MessageID, ToolCallID, Status string
 	Content, RawInput, RawOutput                              json.RawMessage

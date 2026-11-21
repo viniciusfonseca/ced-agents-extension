@@ -21,6 +21,11 @@ type configOption struct {
 	Options      []configChoice `json:"options"`
 }
 
+type sessionModes struct {
+	CurrentModeID  string
+	AvailableModes []struct{ ID, Name string }
+}
+
 type configResponse struct {
 	ConfigOptions []configOption
 }
@@ -38,6 +43,13 @@ func (s *session) configOption(category string) *configOption {
 			(option.ID == category || category == "thought_level" && (option.ID == "effort" || option.ID == "reasoning_effort")) {
 			return option
 		}
+	}
+	if category == "mode" && len(s.modes.AvailableModes) > 0 {
+		option := &configOption{CurrentValue: s.modes.CurrentModeID}
+		for _, mode := range s.modes.AvailableModes {
+			option.Options = append(option.Options, configChoice{Value: mode.ID, Name: mode.Name})
+		}
+		return option
 	}
 	return nil
 }
@@ -71,7 +83,7 @@ func (m *sessions) setConfig(s *session, category, value string) error {
 	}
 
 	p, id, configID := s.peer, s.remoteID, option.ID
-	revision := s.configRevision
+	revision, modeRevision := s.configRevision, s.modeRevision
 	s.configuring, s.Error = true, ""
 	m.jobs.Add(1)
 	go func() {
@@ -79,14 +91,23 @@ func (m *sessions) setConfig(s *session, category, value string) error {
 		ctx, cancel := context.WithTimeout(m.ctx, 20*time.Second)
 		defer cancel()
 		var result configResponse
-		err := p.exchange(ctx, "session/set_config_option", map[string]string{
-			"sessionId": id, "configId": configID, "value": value,
-		}, &result, nil)
+		var err error
+		if configID == "" {
+			err = p.exchange(ctx, "session/set_mode", map[string]string{"sessionId": id, "modeId": value}, &struct{}{}, nil)
+		} else {
+			err = p.exchange(ctx, "session/set_config_option", map[string]string{
+				"sessionId": id, "configId": configID, "value": value,
+			}, &result, nil)
+		}
 		m.mu.Lock()
 		defer m.mu.Unlock()
 		s.configuring = false
 		if err != nil {
 			s.Error = boundedText(err.Error(), 1024)
+		} else if configID == "" {
+			if s.modeRevision == modeRevision {
+				s.modes.CurrentModeID = value
+			}
 		} else if s.configRevision == revision {
 			if result.ConfigOptions == nil {
 				s.Error = "The adapter did not confirm the configuration."

@@ -35,19 +35,19 @@ type permissionPrompt struct {
 	ID      string             `json:"id"`
 	Title   string             `json:"title"`
 	Options []permissionOption `json:"options"`
+	rpcID   json.RawMessage
 }
 
 type session struct {
-	ID             string            `json:"id"`
-	Title          string            `json:"title"`
-	Agent          string            `json:"agent"`
-	Busy           bool              `json:"busy"`
-	Connected      bool              `json:"connected"`
-	Cancelled      bool              `json:"cancelled"`
-	Error          string            `json:"error,omitempty"`
-	Messages       []chatMessage     `json:"messages"`
-	Permission     *permissionPrompt `json:"permission,omitempty"`
-	Revision       uint64            `json:"revision"`
+	ID             string        `json:"id"`
+	Title          string        `json:"title"`
+	Agent          string        `json:"agent"`
+	Busy           bool          `json:"busy"`
+	Connected      bool          `json:"connected"`
+	Cancelled      bool          `json:"cancelled"`
+	Error          string        `json:"error,omitempty"`
+	Messages       []chatMessage `json:"messages"`
+	Revision       uint64        `json:"revision"`
 	providerID     string
 	cwd            string
 	local          bool
@@ -55,16 +55,25 @@ type session struct {
 	updatedAt      time.Time
 	config         []configOption
 	configRevision uint64
+	modes          sessionModes
+	modeRevision   uint64
 	configuring    bool
 	remoteID       string
 	peer           *acpPeer
-	permissionRPC  json.RawMessage
+	permissions    []permissionPrompt
 	turnDone       chan struct{}
 	turnSent       chan struct{}
 	splitMessage   bool
 	replayMessage  string
 	totalText      int
 	nextActivity   uint64
+}
+
+func (s *session) permission() *permissionPrompt {
+	if len(s.permissions) == 0 {
+		return nil
+	}
+	return &s.permissions[0]
 }
 
 func boundedText(text string, maxBytes int) string {
@@ -200,6 +209,7 @@ func (m *sessions) connect(s *session, agent provider) {
 	if err == nil {
 		var result struct {
 			SessionID string
+			Modes     sessionModes
 			configResponse
 		}
 		params := map[string]any{"cwd": s.cwd, "mcpServers": []any{}}
@@ -218,8 +228,12 @@ func (m *sessions) connect(s *session, agent provider) {
 		if err == nil {
 			m.mu.Lock()
 			s.remoteID = result.SessionID
-			if result.ConfigOptions != nil {
+			if result.ConfigOptions != nil && s.configRevision == 0 {
 				s.config = result.ConfigOptions
+			}
+			s.modes.AvailableModes = result.Modes.AvailableModes
+			if s.modeRevision == 0 {
+				s.modes.CurrentModeID = result.Modes.CurrentModeID
 			}
 			s.Connected = true
 			m.mu.Unlock()
@@ -255,14 +269,17 @@ func (m *sessions) connect(s *session, agent provider) {
 
 func (m *sessions) finish(s *session, err error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	s.Busy, s.Permission = false, nil
+	p, pending := s.peer, s.permissions
+	s.Busy, s.permissions = false, nil
 	s.endReasoning()
-	s.permissionRPC = nil
 	if err != nil {
 		s.Error = boundedText(err.Error(), 1024)
 	}
 	s.Revision++
+	m.mu.Unlock()
+	for _, request := range pending {
+		replyPermission(p, request.rpcID, "")
+	}
 }
 
 func (m *sessions) prompt(s *session, text string) error {
@@ -312,8 +329,8 @@ func (m *sessions) cancel(s *session) error {
 	p, id, done, sent := s.peer, s.remoteID, s.turnDone, s.turnSent
 	s.Cancelled = true
 	s.Revision++
-	pendingRPC := s.permissionRPC
-	s.Permission, s.permissionRPC = nil, nil
+	pending := s.permissions
+	s.permissions = nil
 	m.jobs.Add(1)
 	m.mu.Unlock()
 	go func() {
@@ -328,8 +345,8 @@ func (m *sessions) cancel(s *session) error {
 		defer timer.Stop()
 		select {
 		case <-sent:
-			if pendingRPC != nil {
-				replyPermission(p, pendingRPC, "")
+			for _, request := range pending {
+				replyPermission(p, request.rpcID, "")
 			}
 			_ = p.notify("session/cancel", map[string]string{"sessionId": id})
 		case <-m.ctx.Done():
@@ -355,15 +372,19 @@ func replyPermission(p *acpPeer, id json.RawMessage, option string) {
 	p.reply(id, map[string]any{"outcome": outcome}, nil)
 }
 
-func (m *sessions) choose(s *session, id, option string) error {
+func (m *sessions) choose(s *session, id string, choice int) error {
 	m.mu.Lock()
-	if m.ctx.Err() != nil || s.peer == nil || s.Permission == nil || s.Permission.ID != id ||
-		option != "" && !slices.ContainsFunc(s.Permission.Options, func(o permissionOption) bool { return o.ID == option }) {
+	request := s.permission()
+	if m.ctx.Err() != nil || s.peer == nil || request == nil || request.ID != id || choice >= len(request.Options) {
 		m.mu.Unlock()
 		return errors.New("That permission request is no longer available.")
 	}
-	p, rpcID := s.peer, s.permissionRPC
-	s.Permission, s.permissionRPC = nil, nil
+	option := ""
+	if choice >= 0 {
+		option = request.Options[choice].ID
+	}
+	p, rpcID := s.peer, request.rpcID
+	s.permissions = slices.Delete(s.permissions, 0, 1)
 	s.Revision++
 	m.jobs.Add(1)
 	m.mu.Unlock()
@@ -414,6 +435,11 @@ func (m *sessions) update(s *session, p *acpPeer, msg rpcMessage) {
 				s.Title = boundedText(title, 100)
 				s.Revision++
 			}
+		case "current_mode_update":
+			if update.CurrentModeID != "" {
+				s.modes.CurrentModeID = update.CurrentModeID
+				s.modeRevision++
+			}
 		case "config_option_update":
 			if s.remoteID == params.SessionID && update.ConfigOptions != nil {
 				s.config = update.ConfigOptions
@@ -436,19 +462,29 @@ func (m *sessions) update(s *session, p *acpPeer, msg rpcMessage) {
 		err := json.Unmarshal(msg.Params, &params)
 		m.mu.Lock()
 		if err == nil && params.SessionID != "" && params.SessionID == s.remoteID && s.Connected && s.Busy && !s.Cancelled &&
-			s.Permission == nil && len(params.Options) <= 12 {
+			len(s.permissions) < 12 && len(params.Options) <= 12 {
 			options := make([]permissionOption, 0, len(params.Options))
+			seen := make(map[string]bool)
 			for _, option := range params.Options {
-				if option.ID != "" && len(option.ID) <= 128 && (option.Kind == "allow_once" || option.Kind == "reject_once") {
-					option.Name = boundedText(option.Name, 128)
-					options = append(options, option)
+				if option.ID == "" || len(option.ID) > 128 || seen[option.ID] {
+					continue
+				}
+				switch option.Kind {
+				case "allow_once", "reject_once", "allow_always", "reject_always":
+					option.Name = displayText(option.Name, false, 128)
+					if strings.TrimSpace(option.Name) != "" {
+						options = append(options, option)
+						seen[option.ID] = true
+					}
 				}
 			}
-			s.Revision++
-			s.Permission = &permissionPrompt{ID: strconv.FormatUint(s.Revision, 10), Title: boundedText(params.ToolCall.Title, 256), Options: options}
-			s.permissionRPC = msg.ID
-			m.mu.Unlock()
-			return
+			if len(options) > 0 {
+				s.Revision++
+				s.permissions = append(s.permissions, permissionPrompt{ID: strconv.FormatUint(s.Revision, 10),
+					Title: boundedText(params.ToolCall.Title, 256), Options: options, rpcID: msg.ID})
+				m.mu.Unlock()
+				return
+			}
 		}
 		m.mu.Unlock()
 		replyPermission(p, msg.ID, "")

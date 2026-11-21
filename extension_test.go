@@ -185,12 +185,22 @@ func TestAgentFixture(t *testing.T) {
 	sendUpdate := func(update map[string]any) {
 		write(map[string]any{"method": "session/update", "params": map[string]any{"sessionId": remote, "update": update}})
 	}
-	model, effort := "standard", "low"
+	model, effort, approvalMode := "standard", "low", "manual"
+	modeOptions := []configChoice{{Value: "manual", Name: "Manual"}, {Value: "automatic", Name: "Automatic"}}
+	setup := func(config []configOption) map[string]any {
+		result := map[string]any{"sessionId": remote, "configOptions": config}
+		if agent == "claude" {
+			result["modes"] = map[string]any{"currentModeId": approvalMode, "availableModes": []map[string]string{
+				{"id": "manual", "name": "Manual"}, {"id": "automatic", "name": "Automatic"},
+			}}
+		}
+		return result
+	}
 	config := func() []configOption {
 		if agent == "devin" {
 			return []configOption{}
 		}
-		return []configOption{
+		options := []configOption{
 			{ID: "fixture-model", Category: "model", Type: "select", CurrentValue: model,
 				Options: []configChoice{{Name: "Models", Options: []configChoice{
 					{Value: "standard", Name: "Standard"}, {Value: "advanced", Name: "Advanced"},
@@ -198,6 +208,11 @@ func TestAgentFixture(t *testing.T) {
 			{ID: "fixture-effort", Category: "thought_level", Type: "select", CurrentValue: effort,
 				Options: []configChoice{{Value: "low", Name: "Low"}, {Value: "high", Name: "High"}}},
 		}
+		if agent == "codex" {
+			options = append(options, configOption{ID: "fixture-approval", Category: "mode", Type: "select",
+				CurrentValue: approvalMode, Options: modeOptions})
+		}
+		return options
 	}
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -210,6 +225,7 @@ func TestAgentFixture(t *testing.T) {
 	outside := root + "-other"
 	now := time.Now()
 	var promptID json.RawMessage
+	var parallelPermissions bool
 	for s.Scan() {
 		var msg rpcMessage
 		if json.Unmarshal(s.Bytes(), &msg) != nil {
@@ -283,7 +299,7 @@ func TestAgentFixture(t *testing.T) {
 				sendUpdate(map[string]any{"sessionUpdate": "agent_message_chunk", "messageId": "answer",
 					"content": map[string]string{"type": "text", "text": part}})
 			}
-			reply(map[string]any{"configOptions": config()})
+			reply(setup(config()))
 		case "session/new":
 			var params struct {
 				Cwd        string
@@ -292,7 +308,7 @@ func TestAgentFixture(t *testing.T) {
 			if json.Unmarshal(msg.Params, &params) != nil || (params.Cwd != root && params.Cwd != filepath.Join(root, "nested")) || params.MCPServers == nil {
 				os.Exit(2)
 			}
-			reply(map[string]any{"sessionId": remote, "configOptions": config()})
+			reply(setup(config()))
 		case "session/set_config_option":
 			var params struct{ SessionID, ConfigID, Value string }
 			if json.Unmarshal(msg.Params, &params) != nil || params.SessionID != remote {
@@ -304,12 +320,25 @@ func TestAgentFixture(t *testing.T) {
 				effort = "low"
 			case "fixture-effort":
 				effort = params.Value
+			case "fixture-approval":
+				if agent != "codex" {
+					os.Exit(6)
+				}
+				approvalMode = params.Value
 			default:
 				os.Exit(6)
 			}
 			reply(map[string]any{"configOptions": config()})
+		case "session/set_mode":
+			var params struct{ SessionID, ModeID string }
+			if json.Unmarshal(msg.Params, &params) != nil || params.SessionID != remote || agent != "claude" {
+				os.Exit(6)
+			}
+			approvalMode = params.ModeID
+			reply(struct{}{})
 		case "session/prompt":
 			promptID = msg.ID
+			parallelPermissions = strings.Contains(string(msg.Params), "parallel-permission")
 			if strings.Contains(string(msg.Params), "wait") {
 				sendUpdate(map[string]any{"sessionUpdate": "tool_call", "toolCallId": "live",
 					"title": "Check files", "status": "in_progress"})
@@ -321,8 +350,19 @@ func TestAgentFixture(t *testing.T) {
 			if strings.Contains(string(msg.Params), "permission") {
 				write(map[string]any{"id": "permission-1", "method": "session/request_permission", "params": map[string]any{
 					"sessionId": remote, "toolCall": map[string]string{"title": "Fixture permission"},
-					"options": []permissionOption{{ID: "allow", Name: "Allow once", Kind: "allow_once"}},
+					"options": []permissionOption{
+						{ID: "allow", Name: "Allow once", Kind: "allow_once"},
+						{ID: "allow-always", Name: "Always allow this tool", Kind: "allow_always"},
+						{ID: "deny", Name: "Deny", Kind: "reject_once"},
+						{ID: "deny-always", Name: "Always deny this tool", Kind: "reject_always"},
+					},
 				}})
+				if parallelPermissions {
+					write(map[string]any{"id": "permission-2", "method": "session/request_permission", "params": map[string]any{
+						"sessionId": remote, "toolCall": map[string]string{"title": "Second request"},
+						"options": []permissionOption{{ID: "deny-always", Name: "Always deny this tool", Kind: "reject_always"}},
+					}})
+				}
 			} else if !strings.Contains(string(msg.Params), "wait") {
 				sendUpdate(map[string]any{"sessionUpdate": "session_info_update", "title": "Fixture " + agent})
 				if agent != "devin" {
@@ -337,7 +377,20 @@ func TestAgentFixture(t *testing.T) {
 				"content": []any{map[string]any{"type": "content", "content": map[string]string{"type": "text", "text": "Cancelled"}}}})
 			write(map[string]any{"id": promptID, "result": map[string]string{"stopReason": "cancelled"}})
 		case "":
-			if string(msg.ID) != "\"permission-1\"" || !strings.Contains(string(msg.Result), "\"optionId\":\"allow\"") {
+			var result struct {
+				Outcome struct{ Outcome, OptionID string }
+			}
+			if json.Unmarshal(msg.Result, &result) != nil || result.Outcome.Outcome != "selected" {
+				os.Exit(4)
+			}
+			if parallelPermissions {
+				if string(msg.ID) == `"permission-1"` && result.Outcome.OptionID == "allow-always" {
+					continue
+				}
+				if string(msg.ID) != `"permission-2"` || result.Outcome.OptionID != "deny-always" {
+					os.Exit(4)
+				}
+			} else if string(msg.ID) != `"permission-1"` || result.Outcome.OptionID != "allow" {
 				os.Exit(4)
 			}
 			write(map[string]any{"id": promptID, "result": map[string]string{"stopReason": "end_turn"}})
@@ -690,6 +743,64 @@ func TestGroupedSessionActions(t *testing.T) {
 	model = tab.wait(t, func(m tabModel) bool { return !m.Refresh })
 	if !strings.Contains(model.Text, "does not support deleting") || len(model.Groups[1].Items) != 1 {
 		t.Fatalf("Unsupported deletion should keep the session and report the adapter error: %+v", model)
+	}
+}
+
+func TestComposerApprovalsAndModes(t *testing.T) {
+	r := launch(t)
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	init := initialization(root)
+	init["host"].(map[string]any)["tabWidgets"] = 9
+	r.send(t, request(1, "ced/initialize", init))
+	r.expect(t, 1, 0)
+	r.send(t, request(2, "ced/activate", withContext("reason", map[string]string{"event": "onCommand:" + commandID})))
+	r.expect(t, 2, 0)
+	tab := tabClient{r, 2}
+	for _, harness := range []string{"codex", "claude", "devin"} {
+		tab.action(t, "harness", harness, 0)
+		tab.action(t, groupAction(root), "", 0)
+		model := tab.wait(t, func(m tabModel) bool { return m.Input != nil && !m.Refresh })
+		if len(model.Selectors) != 3 || model.Selectors[2].Placement != "composer" {
+			t.Fatalf("Missing approval mode picker: %+v", model.Selectors)
+		}
+		mode := model.Selectors[2]
+		if harness == "devin" {
+			if len(mode.Options) != 0 || mode.Selected != "" {
+				t.Fatalf("Unadvertised permission modes appeared: %+v", mode)
+			}
+			tab.action(t, mode.ID, "automatic", -32010)
+			break
+		}
+		if mode.Selected != "manual" || len(mode.Options) != 2 {
+			t.Fatalf("Wrong approval modes for %s: %+v", harness, mode)
+		}
+		tab.action(t, mode.ID, "unknown", -32010)
+		tab.action(t, mode.ID, "automatic", 0)
+		model = tab.wait(t, func(m tabModel) bool { return !m.Refresh && m.Selectors[2].Selected == "automatic" })
+		if harness == "codex" {
+			tab.action(t, model.Input.ID, "parallel-permission", 0)
+			model = tab.wait(t, func(m tabModel) bool { return m.Chat.Approval != nil })
+			approval := model.Chat.Approval
+			if !strings.Contains(approval.Title, "Fixture permission") || len(model.Actions) != 0 ||
+				len(approval.Actions) != 5 || approval.Actions[1].Label != "Always allow this tool" ||
+				model.Input.Stop == "" || !model.Input.Disabled || !model.Selectors[2].Disabled {
+				t.Fatalf("Wrong pending approval model: %+v", model)
+			}
+			tab.action(t, approval.Actions[1].ID, "", 0)
+			model = tab.wait(t, func(m tabModel) bool {
+				return m.Chat.Approval != nil && strings.Contains(m.Chat.Approval.Title, "Second request")
+			})
+			tab.action(t, approval.Actions[1].ID, "", -32010)
+			tab.action(t, model.Chat.Approval.Actions[0].ID, "", 0)
+			model = tab.wait(t, func(m tabModel) bool { return m.Input != nil && !m.Refresh })
+			if model.Chat.Approval != nil || model.Text != "" {
+				t.Fatalf("Approval did not resolve: %+v", model)
+			}
+		}
+		tab.action(t, "back", "", 0)
 	}
 }
 
