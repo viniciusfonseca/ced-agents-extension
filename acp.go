@@ -69,6 +69,7 @@ type acpPeer struct {
 	stdin     io.WriteCloser
 	stdout    io.ReadCloser
 	done      chan struct{}
+	stopped   chan struct{}
 	readErr   error // Read after done is closed.
 	writeMu   sync.Mutex
 	mu        sync.Mutex
@@ -95,7 +96,7 @@ func startACP(cmd *exec.Cmd, root string, onMessage func(*acpPeer, rpcMessage)) 
 		stdout.Close()
 		return nil, err
 	}
-	p := &acpPeer{cmd: cmd, stdin: stdin, stdout: stdout, pending: make(map[string]chan rpcMessage), done: make(chan struct{}), onMessage: onMessage}
+	p := &acpPeer{cmd: cmd, stdin: stdin, stdout: stdout, pending: make(map[string]chan rpcMessage), done: make(chan struct{}), stopped: make(chan struct{}), onMessage: onMessage}
 	go p.read()
 	return p, nil
 }
@@ -124,6 +125,7 @@ func initializeACP(ctx context.Context, p *acpPeer) (acpInitialization, error) {
 
 func (p *acpPeer) stop() {
 	p.stopOnce.Do(func() {
+		close(p.stopped)
 		_ = syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL)
 		_ = p.stdin.Close()
 		_ = p.stdout.Close()
@@ -191,6 +193,10 @@ func (p *acpPeer) exchange(ctx context.Context, method string, params any, resul
 	p.mu.Unlock()
 	defer func() { p.mu.Lock(); delete(p.pending, id); p.mu.Unlock() }()
 	if err := p.send(map[string]any{"jsonrpc": "2.0", "id": json.RawMessage(id), "method": method, "params": params}); err != nil {
+		p.stop()
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		return errors.New("The adapter stopped accepting requests.")
 	}
 	if sent != nil {

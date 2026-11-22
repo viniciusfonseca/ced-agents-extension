@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -66,10 +67,11 @@ int main(int argc, char **argv) {
     deadline = ced_ext_now() + 8;
     while (*host->instances[0].command) tick(host, deadline);
     assert(!strcmp(host->reveal_tab, "viniciusfonseca.agents.panel"));
-    assert(!strcmp(ced_ext_json_string(host->instances[0].tabs[0].model, "heading"), "Agents"));
     cJSON *model = host->instances[0].tabs[0].model;
-    assert(!strcmp(ced_ext_json_string(cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(model, "selectors"), 0),
-                                      "selected"), "codex"));
+    const cJSON *selector = cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(model, "selectors"), 0);
+    assert(!strcmp(ced_ext_json_string(model, "heading"), ""));
+    assert(!strcmp(ced_ext_json_string(selector, "label"), ""));
+    assert(!strcmp(ced_ext_json_string(selector, "selected"), "codex"));
     const cJSON *group = cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(model, "groups"), 0);
     assert(!strcmp(ced_ext_json_string(group, "label"), root));
     assert(cJSON_IsArray(cJSON_GetObjectItemCaseSensitive(group, "items")));
@@ -86,6 +88,32 @@ int main(int argc, char **argv) {
     deadline = ced_ext_now() + 8;
     while (*host->instances[0].command) tick(host, deadline);
     assert(!*host->reveal_tab && host->instances[0].tabs[0].model && !*host->instances[0].error);
+
+    char next[CED_PATH], untrusted[CED_PATH];
+    assert(ced_join(next, sizeof next, root, "next") && !mkdir(next, 0700));
+    assert(ced_join(untrusted, sizeof untrusted, root, "untrusted") && !mkdir(untrusted, 0700));
+    assert(ced_extension_set_trusted(profile, next, true, error));
+    CedExtensionProcess *process = host->instances[0].process;
+    assert(host->instances[0].retain_on_workspace_change);
+    strcpy(host->instances[0].tabs[0].input, "draft");
+    ced_extensions_workspace(host, next);
+    settle(host);
+    deadline = ced_ext_now() + 8;
+    while (*host->instances[0].pending) tick(host, deadline);
+    assert(host->trusted && host->instances[0].process == process);
+    assert(host->instances[0].tabs[0].model && !strcmp(host->instances[0].tabs[0].input, "draft"));
+    assert(ced_extensions_tab_action(&host->instances[0], 0, "refresh", ""));
+    deadline = ced_ext_now() + 8;
+    while (*host->instances[0].pending) tick(host, deadline);
+    model = host->instances[0].tabs[0].model;
+    selector = cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(model, "selectors"), 0);
+    group = cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(model, "groups"), 0);
+    assert(!*host->instances[0].error && !strcmp(ced_ext_json_string(selector, "selected"), "claude"));
+    assert(!strcmp(ced_ext_json_string(group, "label"), next));
+
+    ced_extensions_workspace(host, untrusted);
+    settle(host);
+    assert(!host->trusted && !host->instances[0].process && !host->instances[0].tabs[0].model);
     assert(ced_extensions_job(host, EXT_DISABLE, extension_id));
     settle(host);
     deadline = ced_ext_now() + 8;
@@ -96,6 +124,6 @@ int main(int argc, char **argv) {
     ced_commands_free(&commands);
     assert(ced_rpc_memory_used() == 0);
     assert(ced_file_delete(parent, root, error));
-    puts("OK: native CED install, trust, terminal tab reveal, model refresh and cleanup");
+    puts("OK: native CED install, trust, tab reveal, workspace retention and cleanup");
     return 0;
 }

@@ -63,6 +63,7 @@ type session struct {
 	permissions    []permissionPrompt
 	turnDone       chan struct{}
 	turnSent       chan struct{}
+	retryPrompt    string
 	splitMessage   bool
 	replayMessage  string
 	totalText      int
@@ -180,23 +181,43 @@ func (m *sessions) create(agent provider, cwd string, saved *historyEntry) (stri
 		s.remoteID = saved.SessionID
 	}
 	m.items = append(m.items, s)
-	m.jobs.Add(1)
-	go func() {
-		defer m.jobs.Done()
-		m.connect(s, agent)
-	}()
+	m.startConnection(s, agent, false)
 	return s.ID, nil
 }
 
-func (m *sessions) connect(s *session, agent provider) {
+func (m *sessions) reconnect(s *session, agent provider) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.ctx.Err() != nil || s.Connected || s.peer != nil || s.Busy || s.Cancelled || s.configuring {
+		return errors.New("This session is not ready to reconnect.")
+	}
+	s.Busy, s.Error = true, ""
+	s.config, s.modes = nil, sessionModes{}
+	s.configRevision, s.modeRevision = 0, 0
+	s.Revision++
+	m.startConnection(s, agent, len(s.Messages) != 0)
+	return nil
+}
+
+// The caller holds the sessions lock.
+func (m *sessions) startConnection(s *session, agent provider, preserveTranscript bool) {
+	root, resumeID := m.root, s.remoteID
+	m.jobs.Add(1)
+	go func() {
+		defer m.jobs.Done()
+		m.connect(s, agent, root, resumeID, preserveTranscript)
+	}()
+}
+
+func (m *sessions) connect(s *session, agent provider, root, resumeID string, preserveTranscript bool) {
 	cmd, err := m.command(agent)
 	if err != nil {
-		m.finish(s, err)
+		m.finish(s, err, "")
 		return
 	}
-	p, err := startACP(cmd, m.root, func(p *acpPeer, msg rpcMessage) { m.update(s, p, msg) })
+	p, err := startACP(cmd, root, func(p *acpPeer, msg rpcMessage) { m.update(s, p, msg, preserveTranscript) })
 	if err != nil {
-		m.finish(s, errors.New("Could not launch "+agent.Name+". Check the adapter's installation."))
+		m.finish(s, errors.New("Could not launch "+agent.Name+". Check the adapter's installation."), "")
 		return
 	}
 	m.mu.Lock()
@@ -213,15 +234,15 @@ func (m *sessions) connect(s *session, agent provider) {
 			configResponse
 		}
 		params := map[string]any{"cwd": s.cwd, "mcpServers": []any{}}
-		if s.savedID == "" {
+		if resumeID == "" {
 			err = p.exchange(ctx, "session/new", params, &result, nil)
 			if err == nil && result.SessionID == "" {
 				err = errors.New("The adapter returned an empty ACP session ID.")
 			}
 		} else if init.AgentCapabilities.LoadSession {
-			params["sessionId"] = s.savedID
+			params["sessionId"] = resumeID
 			err = p.exchange(ctx, "session/load", params, &result, nil)
-			result.SessionID = s.savedID
+			result.SessionID = resumeID
 		} else {
 			err = errors.New("This adapter cannot reopen saved sessions. Update it to a version with ACP session loading.")
 		}
@@ -239,7 +260,7 @@ func (m *sessions) connect(s *session, agent provider) {
 			m.mu.Unlock()
 		}
 	}
-	m.finish(s, err)
+	m.finish(s, err, "")
 	if err != nil {
 		p.stop()
 	}
@@ -267,19 +288,46 @@ func (m *sessions) connect(s *session, agent provider) {
 	m.mu.Unlock()
 }
 
-func (m *sessions) finish(s *session, err error) {
+func (m *sessions) finish(s *session, err error, prompt string) {
 	m.mu.Lock()
 	p, pending := s.peer, s.permissions
 	s.Busy, s.permissions = false, nil
+	s.turnDone, s.turnSent = nil, nil
+	if p != nil {
+		select {
+		case <-p.stopped:
+			s.Connected = false
+		default:
+		}
+	}
 	s.endReasoning()
 	if err != nil {
 		s.Error = boundedText(err.Error(), 1024)
+		if prompt != "" {
+			s.retryPrompt = prompt
+			for i := range s.Messages {
+				message := &s.Messages[i]
+				if message.Role == "tool" && (message.Status == "pending" || message.Status == "running") {
+					message.Status = "failed"
+				}
+			}
+		}
 	}
 	s.Revision++
 	m.mu.Unlock()
 	for _, request := range pending {
 		replyPermission(p, request.rpcID, "")
 	}
+}
+
+func (m *sessions) retry(s *session) error {
+	m.mu.Lock()
+	text := s.retryPrompt
+	m.mu.Unlock()
+	if text == "" {
+		return errors.New("There is no failed message to retry.")
+	}
+	return m.prompt(s, text)
 }
 
 func (m *sessions) prompt(s *session, text string) error {
@@ -297,6 +345,7 @@ func (m *sessions) prompt(s *session, text string) error {
 		s.Title = boundedText(title, 100)
 	}
 	s.Busy, s.Error = true, ""
+	s.retryPrompt = ""
 	s.updatedAt = time.Now()
 	s.splitMessage = true
 	done, sent := make(chan struct{}), make(chan struct{})
@@ -315,7 +364,10 @@ func (m *sessions) prompt(s *session, text string) error {
 		if err == nil && result.StopReason != "end_turn" && result.StopReason != "cancelled" {
 			err = errors.New("Prompt stopped: " + result.StopReason)
 		}
-		m.finish(s, err)
+		if errors.Is(err, context.DeadlineExceeded) {
+			err = errors.New("The agent reached the 15-minute limit for this message.")
+		}
+		m.finish(s, err, text)
 	}()
 	return nil
 }
@@ -392,7 +444,7 @@ func (m *sessions) choose(s *session, id string, choice int) error {
 	return nil
 }
 
-func (m *sessions) update(s *session, p *acpPeer, msg rpcMessage) {
+func (m *sessions) update(s *session, p *acpPeer, msg rpcMessage, preserveTranscript bool) {
 	switch msg.Method {
 	case "session/update":
 		var params struct {
@@ -404,13 +456,16 @@ func (m *sessions) update(s *session, p *acpPeer, msg rpcMessage) {
 		}
 		m.mu.Lock()
 		defer m.mu.Unlock()
-		if s.remoteID != "" && s.remoteID != params.SessionID {
+		if s.peer != p || s.remoteID != "" && s.remoteID != params.SessionID {
 			return
 		}
 		update := params.Update
 		switch update.SessionUpdate {
 		case "agent_message_chunk", "user_message_chunk", "agent_thought_chunk":
-			replaying := s.savedID != "" && !s.Connected && s.Busy
+			replaying := !s.Connected && s.Busy
+			if replaying && preserveTranscript {
+				return
+			}
 			if !s.Busy || s.remoteID == "" || (update.SessionUpdate == "user_message_chunk" && !replaying) {
 				return
 			}
@@ -446,7 +501,7 @@ func (m *sessions) update(s *session, p *acpPeer, msg rpcMessage) {
 				s.configRevision++
 			}
 		case "tool_call", "tool_call_update":
-			if s.remoteID != "" {
+			if s.remoteID != "" && (s.Connected || !preserveTranscript) {
 				s.updateTool(update)
 			}
 		}

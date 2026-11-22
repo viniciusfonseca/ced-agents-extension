@@ -61,6 +61,7 @@ type tabSessionItem struct {
 	ID     string `json:"id"`
 	Label  string `json:"label"`
 	Delete string `json:"delete"`
+	Busy   bool   `json:"busy,omitempty"`
 }
 
 type tabModel struct {
@@ -92,6 +93,19 @@ func startView(parent context.Context, workspace string, tabWidgets int) *agents
 func (v *agentsView) close() {
 	v.cancel()
 	v.sessions.jobs.Wait()
+}
+
+func (v *agentsView) changeWorkspace(root string) {
+	v.sessions.mu.Lock()
+	defer v.sessions.mu.Unlock()
+	v.sessions.root = root
+	for _, item := range v.sessions.items {
+		item.local = workspaceSession(root, item.cwd)
+	}
+	for _, history := range v.sessions.history {
+		localizeHistory(root, history.entries)
+	}
+	v.confirmDelete = ""
 }
 
 func (v *agentsView) findSession(id string) *session {
@@ -228,6 +242,23 @@ func (v *agentsView) handle(event tabEvent) error {
 		return v.sessions.setConfig(s, details, event.Value)
 	case "prompt":
 		return v.sessions.prompt(s, event.Value)
+	case "retry":
+		return v.sessions.retry(s)
+	case "reconnect":
+		return v.sessions.reconnect(s, v.currentHarness())
+	case "new-after-error":
+		v.sessions.mu.Lock()
+		disconnected := !s.Connected && s.peer == nil && !s.Busy && !s.Cancelled && !s.configuring
+		cwd := s.cwd
+		v.sessions.mu.Unlock()
+		if !disconnected {
+			return errors.New("Wait for the current session to finish.")
+		}
+		id, err := v.sessions.create(v.currentHarness(), cwd, nil)
+		if err == nil {
+			v.selected = id
+		}
+		return err
 	case "cancel":
 		return v.sessions.cancel(s)
 	case "permission":
@@ -268,13 +299,13 @@ func displayText(value string, multiline bool, limit int) string {
 func (v *agentsView) model() tabModel {
 	v.sessions.mu.Lock()
 	defer v.sessions.mu.Unlock()
-	model := tabModel{Heading: "Agents", Actions: []tabAction{}}
+	model := tabModel{Actions: []tabAction{}}
 	add := func(id, label string) {
 		model.Actions = append(model.Actions, tabAction{id, displayText(label, false, 256)})
 	}
 	s := v.findSession(v.selected)
 	if s == nil {
-		harness := tabSelector{ID: "harness", Label: "Harness", Selected: v.harness}
+		harness := tabSelector{ID: "harness", Selected: v.harness}
 		for _, agent := range providers {
 			harness.Options = append(harness.Options, tabAction{ID: agent.ID, Label: agent.Name})
 		}
@@ -303,7 +334,9 @@ func (v *agentsView) model() tabModel {
 		start := v.page * sessionPageSize
 		pageRows := rows[start:min(start+sessionPageSize, len(rows))]
 		if v.tabWidgets >= 8 {
-			model.Groups = sessionGroups(pageRows)
+			spinners := v.tabWidgets >= 10
+			model.Groups = sessionGroups(pageRows, spinners)
+			model.Refresh = spinners && slices.ContainsFunc(pageRows, func(row historyEntry) bool { return row.working })
 			if v.page == 0 && !slices.ContainsFunc(rows, func(row historyEntry) bool { return row.Cwd == v.sessions.root }) {
 				model.Groups = append([]tabSessionGroup{sessionGroup(v.sessions.root)}, model.Groups...)
 			}
@@ -326,7 +359,7 @@ func (v *agentsView) model() tabModel {
 			add("new:"+v.harness, "New Session")
 		}
 		if history := v.sessions.history[v.harness]; history != nil {
-			model.Refresh = history.loading
+			model.Refresh = model.Refresh || history.loading
 			switch {
 			case history.loading:
 				model.Text = "Loading session history…"
@@ -346,18 +379,21 @@ func (v *agentsView) model() tabModel {
 		title += " · " + s.cwd
 	}
 	model.Heading = displayText(title, false, 256)
-	model.Refresh = s.Busy || s.Cancelled || s.configuring
-	model.Selectors = []tabSelector{s.selector("model", "Model"), s.selector("thought_level", "Effort")}
-	if v.tabWidgets >= 2 {
-		model.Selectors[0].Placement = "composer"
-	}
-	if v.tabWidgets >= 3 {
-		model.Selectors[1].Placement = "composer"
-	}
-	if v.tabWidgets >= 9 {
-		approval := s.selector("mode", "Approval Mode")
-		approval.Placement = "composer"
-		model.Selectors = append(model.Selectors, approval)
+	model.Refresh = s.Busy || s.Cancelled || s.configuring || !s.Connected && s.peer != nil
+	loading := s.Busy && !s.Connected
+	if !loading {
+		model.Selectors = []tabSelector{s.selector("model", "Model"), s.selector("thought_level", "Effort")}
+		if v.tabWidgets >= 2 {
+			model.Selectors[0].Placement = "composer"
+		}
+		if v.tabWidgets >= 3 {
+			model.Selectors[1].Placement = "composer"
+		}
+		if v.tabWidgets >= 9 {
+			approval := s.selector("mode", "Approval Mode")
+			approval.Placement = "composer"
+			model.Selectors = append(model.Selectors, approval)
+		}
 	}
 	model.Chat = &tabChat{
 		Author: s.Agent, Messages: transcript(s.Messages, v.tabWidgets),
@@ -382,7 +418,7 @@ func (v *agentsView) model() tabModel {
 		if v.tabWidgets < 9 {
 			model.Text, status = permission.Title, "pending"
 		}
-	case s.Busy && !s.Connected:
+	case loading:
 		model.Text = "Connecting…"
 	case s.Busy:
 		model.Text = "Working..."
@@ -416,9 +452,23 @@ func (v *agentsView) model() tabModel {
 			model.Actions = append(model.Actions, actions...)
 		}
 	}
-	if s.Connected && (v.tabWidgets >= 3 || !s.Busy && !s.Cancelled) {
+	idle := !s.Busy && !s.Cancelled && !s.configuring
+	if idle {
+		if !s.Connected && s.peer == nil {
+			add("reconnect:"+s.ID, "Reconnect")
+			if s.remoteID != "" {
+				add("new-after-error:"+s.ID, "Start New Session")
+			}
+		} else if s.Connected && s.retryPrompt != "" {
+			add("retry:"+s.ID, "Retry Last Message")
+		}
+	}
+	if v.tabWidgets >= 3 || !s.Busy && !s.Cancelled {
 		model.Input = &tabInput{ID: "prompt:" + s.ID, Label: "Send", Placeholder: "Message",
-			Disabled: s.Busy || s.Cancelled || s.configuring}
+			Disabled: !s.Connected || !idle}
+		if !s.Connected && idle {
+			model.Input.Placeholder = "Reconnect to send a message"
+		}
 		if canStop && v.tabWidgets >= 5 {
 			model.Input.Stop = "cancel:" + s.ID
 		}

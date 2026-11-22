@@ -21,8 +21,9 @@ type savedSession struct {
 
 type historyEntry struct {
 	savedSession
-	action string
-	local  bool
+	action  string
+	local   bool
+	working bool
 }
 
 type sessionHistory struct {
@@ -46,25 +47,27 @@ func (m *sessions) refreshHistory(agent provider, force bool) {
 		m.history = make(map[string]*sessionHistory)
 	}
 	m.history[agent.ID] = current
+	root := m.root
 	m.jobs.Add(1)
 	go func() {
 		defer m.jobs.Done()
-		entries, err := m.listHistory(agent)
+		entries, err := m.listHistory(agent, root)
 		m.mu.Lock()
 		defer m.mu.Unlock()
 		current.loading, current.err = false, err
 		if err == nil || len(entries) > 0 {
+			localizeHistory(m.root, entries)
 			current.entries = entries
 		}
 	}()
 }
 
-func (m *sessions) historyPeer(ctx context.Context, agent provider) (*acpPeer, acpInitialization, error) {
+func (m *sessions) historyPeer(ctx context.Context, agent provider, root string) (*acpPeer, acpInitialization, error) {
 	cmd, err := m.command(agent)
 	if err != nil {
 		return nil, acpInitialization{}, err
 	}
-	p, err := startACP(cmd, m.root, func(p *acpPeer, msg rpcMessage) {
+	p, err := startACP(cmd, root, func(p *acpPeer, msg rpcMessage) {
 		if msg.ID != nil {
 			p.reply(msg.ID, nil, &rpcError{Code: -32601, Message: "Unsupported ACP client method."})
 		}
@@ -81,10 +84,10 @@ func (m *sessions) historyPeer(ctx context.Context, agent provider) (*acpPeer, a
 	return p, init, nil
 }
 
-func (m *sessions) listHistory(agent provider) ([]historyEntry, error) {
+func (m *sessions) listHistory(agent provider, root string) ([]historyEntry, error) {
 	ctx, cancel := context.WithTimeout(m.ctx, 45*time.Second)
 	defer cancel()
-	p, _, err := m.historyPeer(ctx, agent)
+	p, _, err := m.historyPeer(ctx, agent, root)
 	if err != nil {
 		return nil, err
 	}
@@ -94,7 +97,6 @@ func (m *sessions) listHistory(agent provider) ([]historyEntry, error) {
 	params := map[string]string{}
 	cursors := make(map[string]bool)
 	seen := make(map[string]bool)
-	local := make(map[string]bool)
 	for {
 		var result struct {
 			Sessions   []savedSession
@@ -113,17 +115,12 @@ func (m *sessions) listHistory(agent provider) ([]historyEntry, error) {
 			}
 			seen[item.SessionID] = true
 			item.Cwd = filepath.Clean(item.Cwd)
-			related, known := local[item.Cwd]
-			if !known {
-				related = workspaceSession(m.root, item.Cwd)
-				local[item.Cwd] = related
-			}
 			if strings.TrimSpace(item.Title) == "" {
 				item.Title = "Untitled Session"
 			}
 			digest := sha256.Sum256([]byte(agent.ID + ":" + item.SessionID))
 			entries = append(entries, historyEntry{
-				savedSession: item, action: "history:" + hex.EncodeToString(digest[:]), local: related,
+				savedSession: item, action: "history:" + hex.EncodeToString(digest[:]),
 			})
 		}
 		if result.NextCursor == "" {
@@ -134,6 +131,17 @@ func (m *sessions) listHistory(agent provider) ([]historyEntry, error) {
 		}
 		cursors[result.NextCursor] = true
 		params["cursor"] = result.NextCursor
+	}
+}
+
+func localizeHistory(root string, entries []historyEntry) {
+	local := make(map[string]bool)
+	for i := range entries {
+		cwd := entries[i].Cwd
+		if _, known := local[cwd]; !known {
+			local[cwd] = workspaceSession(root, cwd)
+		}
+		entries[i].local = local[cwd]
 	}
 }
 
@@ -164,6 +172,7 @@ func (v *agentsView) historyRows() []historyEntry {
 		entries = append(entries, historyEntry{
 			savedSession: savedSession{Cwd: item.cwd, Title: item.Title, UpdatedAt: item.updatedAt},
 			action:       "session:" + item.ID, local: item.local,
+			working: item.Busy && item.turnDone != nil,
 		})
 	}
 	if history := v.sessions.history[v.harness]; history != nil {
@@ -221,7 +230,7 @@ func sessionGroup(cwd string) tabSessionGroup {
 	return tabSessionGroup{Label: sessionListLabel(cwd, 1024), Create: groupAction(cwd), Items: []tabSessionItem{}}
 }
 
-func sessionGroups(rows []historyEntry) []tabSessionGroup {
+func sessionGroups(rows []historyEntry, spinners bool) []tabSessionGroup {
 	var groups []tabSessionGroup
 	for i, row := range rows {
 		if i == 0 || rows[i-1].Cwd != row.Cwd {
@@ -229,7 +238,7 @@ func sessionGroups(rows []historyEntry) []tabSessionGroup {
 		}
 		group := &groups[len(groups)-1]
 		group.Items = append(group.Items, tabSessionItem{
-			ID: row.action, Label: sessionListLabel(row.Title, 256), Delete: "delete:" + row.action,
+			ID: row.action, Label: sessionListLabel(row.Title, 256), Delete: "delete:" + row.action, Busy: spinners && row.working,
 		})
 	}
 	return groups
@@ -298,10 +307,11 @@ func (m *sessions) deleteSession(agent provider, action string) error {
 		m.history[agent.ID] = history
 	}
 	history.deleting, history.err = true, nil
+	root := m.root
 	m.jobs.Add(1)
 	go func() {
 		defer m.jobs.Done()
-		err := m.deleteRemoteSession(agent, remote)
+		err := m.deleteRemoteSession(agent, root, remote)
 		m.mu.Lock()
 		defer m.mu.Unlock()
 		history.deleting, history.err = false, err
@@ -315,10 +325,10 @@ func (m *sessions) deleteSession(agent provider, action string) error {
 	return nil
 }
 
-func (m *sessions) deleteRemoteSession(agent provider, id string) error {
+func (m *sessions) deleteRemoteSession(agent provider, root, id string) error {
 	ctx, cancel := context.WithTimeout(m.ctx, 45*time.Second)
 	defer cancel()
-	p, init, err := m.historyPeer(ctx, agent)
+	p, init, err := m.historyPeer(ctx, agent, root)
 	if err != nil {
 		return err
 	}

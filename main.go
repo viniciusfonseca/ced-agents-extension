@@ -19,7 +19,7 @@ import (
 
 const (
 	extensionID = "viniciusfonseca.agents"
-	version     = "0.4.11"
+	version     = "0.4.17"
 	commandID   = extensionID + ".open"
 	tabID       = extensionID + ".panel"
 )
@@ -44,6 +44,7 @@ type cedPeer struct {
 	workspace                               string
 	active                                  bool
 	tabWidgets                              int
+	workspaceChanges                        bool
 	maxHeader, maxBody, maxDepth, maxResult int
 	view                                    *agentsView
 	lifetime                                context.Context
@@ -61,14 +62,12 @@ func (p *cedPeer) initialize(raw json.RawMessage) (any, *rpcError) {
 		Host struct {
 			Name, Version           string
 			TabProtocol, TabWidgets int
+			WorkspaceChanges        bool
 		}
-		Extension   struct{ ID, Version string }
-		APIVersions []string
-		Context     cedContext
-		Workspace   struct {
-			URI     string
-			Trusted bool
-		}
+		Extension           struct{ ID, Version string }
+		APIVersions         []string
+		Context             cedContext
+		Workspace           cedWorkspace
 		GrantedCapabilities []string
 		HostMethods         []string
 		Limits              map[string]int
@@ -90,9 +89,8 @@ func (p *cedPeer) initialize(raw json.RawMessage) (any, *rpcError) {
 	if !init.Workspace.Trusted {
 		return nil, domain(-32001, "PermissionDenied", "Agents requires a trusted workspace.")
 	}
-	root, err := url.Parse(init.Workspace.URI)
-	if err != nil || root.Scheme != "file" || root.Host != "" || root.User != nil ||
-		root.RawQuery != "" || root.Fragment != "" || !filepath.IsAbs(root.Path) || strings.ContainsRune(root.Path, 0) {
+	root := init.Workspace.path()
+	if root == "" {
 		return nil, invalid
 	}
 	for _, name := range strings.Fields("maxHeaderBytes maxMessageBytes maxJsonDepth maxQueuedBytes maxPendingRequests maxDocumentBytes maxEditsPerTransaction maxSubscriptions maxCommandArgumentsBytes maxCommandResultBytes maxStateBytes maxPresentationBytes maxLogMessageBytes maxLogBytesPerSecond maxMessagesPer10Seconds initializeTimeoutMs activateTimeoutMs commandTimeoutMs serviceTimeoutMs deactivateTimeoutMs") {
@@ -104,12 +102,31 @@ func (p *cedPeer) initialize(raw json.RawMessage) (any, *rpcError) {
 	p.maxBody = min(p.maxBody, init.Limits["maxMessageBytes"], init.Limits["maxQueuedBytes"])
 	p.maxDepth = min(p.maxDepth, init.Limits["maxJsonDepth"])
 	p.maxResult = init.Limits["maxCommandResultBytes"]
-	p.context, p.workspace = init.Context, root.Path
+	p.context, p.workspace = init.Context, root
 	p.tabWidgets = init.Host.TabWidgets
-	return map[string]any{
+	p.workspaceChanges = init.Host.WorkspaceChanges
+	result := map[string]any{
 		"extension":  map[string]string{"id": extensionID, "version": version},
 		"apiVersion": "1.0", "requiredHostMethods": []string{},
-	}, nil
+	}
+	if p.workspaceChanges {
+		result["retainOnWorkspaceChange"] = true
+	}
+	return result, nil
+}
+
+type cedWorkspace struct {
+	URI     string
+	Trusted bool
+}
+
+func (w cedWorkspace) path() string {
+	u, err := url.Parse(w.URI)
+	if err != nil || u.Scheme != "file" || u.Host != "" || u.User != nil || u.RawQuery != "" ||
+		u.Fragment != "" || !filepath.IsAbs(u.Path) || strings.ContainsRune(u.Path, 0) {
+		return ""
+	}
+	return filepath.Clean(u.Path)
 }
 
 func (p *cedPeer) handle(msg rpcMessage) (any, *rpcError, bool) {
@@ -123,6 +140,7 @@ func (p *cedPeer) handle(msg rpcMessage) (any, *rpcError, bool) {
 		CommandID string
 		Arguments json.RawMessage
 		Editor    json.RawMessage
+		Workspace cedWorkspace
 	}
 	if json.Unmarshal(msg.Params, &params) != nil {
 		return nil, &rpcError{Code: -32602, Message: "Invalid command parameters."}, false
@@ -130,10 +148,21 @@ func (p *cedPeer) handle(msg rpcMessage) (any, *rpcError, bool) {
 	if p.workspace == "" {
 		return nil, domain(-32007, "NotActive", "Extension is not initialized."), false
 	}
-	if !p.context.matches(params.Context) {
+	newGeneration := p.workspaceChanges && params.Context.valid() &&
+		params.Context.SessionID == p.context.SessionID && *params.Context.Generation > *p.context.Generation
+	if !p.context.matches(params.Context) && !(newGeneration && (msg.Method == "ced/workspaceChanged" || msg.Method == "ced/deactivate")) {
 		return nil, domain(-32003, "InvalidContext", "Invalid extension context."), false
 	}
 	switch msg.Method {
+	case "ced/workspaceChanged":
+		root := params.Workspace.path()
+		if !p.active || !newGeneration || !params.Workspace.Trusted || root == "" {
+			return nil, domain(-32003, "InvalidContext", "Invalid workspace transition."), false
+		}
+		p.context, p.workspace = params.Context, root
+		if p.view != nil {
+			p.view.changeWorkspace(root)
+		}
 	case "ced/activate":
 		var reason struct{ Event string }
 		if json.Unmarshal(params.Reason, &reason) != nil || reason.Event != "onCommand:"+commandID {

@@ -226,6 +226,7 @@ func TestAgentFixture(t *testing.T) {
 	now := time.Now()
 	var promptID json.RawMessage
 	var parallelPermissions bool
+	var failedTurn, restored bool
 	for s.Scan() {
 		var msg rpcMessage
 		if json.Unmarshal(s.Bytes(), &msg) != nil {
@@ -275,8 +276,20 @@ func TestAgentFixture(t *testing.T) {
 				SessionID, Cwd string
 				MCPServers     []any
 			}
-			if json.Unmarshal(msg.Params, &params) != nil || params.SessionID != agent+"-outside" ||
-				params.Cwd != outside || params.MCPServers == nil {
+			if json.Unmarshal(msg.Params, &params) != nil || params.MCPServers == nil {
+				os.Exit(2)
+			}
+			if params.SessionID == agent+"-session" && params.Cwd == root {
+				if agent == "devin" {
+					write(map[string]any{"id": msg.ID, "error": map[string]any{"code": -32601, "message": "Cannot restore this session"}})
+					continue
+				}
+				restored = true
+				sendUpdate(map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]string{"type": "text", "text": "Replayed partial reply"}})
+				reply(setup(config()))
+				continue
+			}
+			if params.SessionID != agent+"-outside" || params.Cwd != outside {
 				os.Exit(2)
 			}
 			remote = params.SessionID
@@ -338,6 +351,15 @@ func TestAgentFixture(t *testing.T) {
 			reply(struct{}{})
 		case "session/prompt":
 			promptID = msg.ID
+			if strings.Contains(string(msg.Params), "fixture-disconnect") && !restored {
+				sendUpdate(map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]string{"type": "text", "text": "Partial reply"}})
+				os.Exit(1)
+			}
+			if strings.Contains(string(msg.Params), "fixture-error") && !failedTurn {
+				failedTurn = true
+				write(map[string]any{"id": msg.ID, "error": map[string]any{"code": -32603, "message": "Fixture turn failed"}})
+				continue
+			}
 			parallelPermissions = strings.Contains(string(msg.Params), "parallel-permission")
 			if strings.Contains(string(msg.Params), "wait") {
 				sendUpdate(map[string]any{"sessionUpdate": "tool_call", "toolCallId": "live",
@@ -444,9 +466,16 @@ type tabClient struct {
 
 func (c *tabClient) action(t *testing.T, action, value string, code int) tabModel {
 	t.Helper()
+	return c.actionInContext(t, mockContext, action, value, code)
+}
+
+func (c *tabClient) actionInContext(t *testing.T, context map[string]any, action, value string, code int) tabModel {
+	t.Helper()
 	c.id++
 	message := openCommand(c.id)
-	message["params"].(map[string]any)["arguments"] = []tabEvent{{TabID: tabID, Action: action, Value: value}}
+	params := message["params"].(map[string]any)
+	params["context"] = context
+	params["arguments"] = []tabEvent{{TabID: tabID, Action: action, Value: value}}
 	c.extension.send(t, message)
 	response := c.extension.expect(t, c.id, code)
 	if code != 0 {
@@ -499,7 +528,7 @@ func TestPackagedEndToEnd(t *testing.T) {
 	r.expect(t, 6, -32602)
 	r.send(t, openCommand(7))
 	model := tabResponse(t, r.expect(t, 7, 0))
-	if model.Heading != "Agents" || len(model.Selectors) != 1 ||
+	if model.Heading != "" || len(model.Selectors) != 1 || model.Selectors[0].Label != "" ||
 		model.Selectors[0].Selected != "codex" || len(model.Selectors[0].Options) != len(providers) {
 		t.Fatalf("Wrong empty view: %+v", model)
 	}
@@ -511,7 +540,7 @@ func TestPackagedEndToEnd(t *testing.T) {
 			t.Fatalf("Sessions leaked between harnesses: %+v", model)
 		}
 		tab.action(t, "new:"+agent.ID, "", 0)
-		model = tab.wait(t, func(m tabModel) bool { return m.Input != nil })
+		model = tab.wait(t, func(m tabModel) bool { return m.Input != nil && !m.Input.Disabled })
 		if model.Selectors[0].Placement != "" {
 			t.Fatalf("Unexpected composer selector on tab widgets v1")
 		}
@@ -546,7 +575,7 @@ func TestPackagedEndToEnd(t *testing.T) {
 		}
 		tab.action(t, prompt, "parallel", -32010)
 		tab.action(t, "cancel:"+id, "", 0)
-		model = tab.wait(t, func(m tabModel) bool { return m.Input != nil })
+		model = tab.wait(t, func(m tabModel) bool { return m.Input != nil && !m.Input.Disabled })
 		if hasMessage(model, "Check files") || hasMessage(model, "Checking the results") {
 			t.Fatal("Host with tab widgets v1 received activity entries")
 		}
@@ -562,7 +591,7 @@ func TestPackagedEndToEnd(t *testing.T) {
 			return false
 		})
 		tab.action(t, permission, "", 0)
-		tab.wait(t, func(m tabModel) bool { return m.Input != nil })
+		tab.wait(t, func(m tabModel) bool { return m.Input != nil && !m.Input.Disabled })
 		tab.action(t, "back", "", 0)
 	}
 	model = tab.wait(t, func(m tabModel) bool { return !m.Refresh })
@@ -620,7 +649,7 @@ func TestMachineSessionHistory(t *testing.T) {
 	tab.action(t, other, "", -32010)
 	tab.action(t, "harness", "codex", 0)
 	tab.action(t, other, "", 0)
-	model = tab.wait(t, func(m tabModel) bool { return m.Input != nil })
+	model = tab.wait(t, func(m tabModel) bool { return m.Input != nil && !m.Input.Disabled })
 	messages := model.Chat.Messages
 	if len(messages) != 4 || messages[0] != (chatMessage{Role: "user", Text: "Old question"}) ||
 		messages[1].Role != "reasoning" || messages[1].ID == "" || messages[1].Status != "" || messages[1].Text != "Inspect the files" ||
@@ -746,6 +775,20 @@ func TestGroupedSessionActions(t *testing.T) {
 	}
 }
 
+func TestSessionSelectorsWhileConnecting(t *testing.T) {
+	active := &session{ID: "1", Busy: true}
+	view := agentsView{selected: active.ID, tabWidgets: 9, sessions: sessions{items: []*session{active}}}
+	model := view.model()
+	if model.Text != "Connecting…" || len(model.Selectors) != 0 {
+		t.Fatalf("Connecting session should hide its selectors: %+v", model)
+	}
+	active.Connected = true
+	model = view.model()
+	if model.Text != "Working..." || len(model.Selectors) != 3 {
+		t.Fatalf("Connected session should show its selectors during a turn: %+v", model)
+	}
+}
+
 func TestComposerApprovalsAndModes(t *testing.T) {
 	r := launch(t)
 	root, err := filepath.EvalSymlinks(t.TempDir())
@@ -762,7 +805,7 @@ func TestComposerApprovalsAndModes(t *testing.T) {
 	for _, harness := range []string{"codex", "claude", "devin"} {
 		tab.action(t, "harness", harness, 0)
 		tab.action(t, groupAction(root), "", 0)
-		model := tab.wait(t, func(m tabModel) bool { return m.Input != nil && !m.Refresh })
+		model := tab.wait(t, func(m tabModel) bool { return m.Input != nil && !m.Input.Disabled && !m.Refresh })
 		if len(model.Selectors) != 3 || model.Selectors[2].Placement != "composer" {
 			t.Fatalf("Missing approval mode picker: %+v", model.Selectors)
 		}
@@ -795,7 +838,7 @@ func TestComposerApprovalsAndModes(t *testing.T) {
 			})
 			tab.action(t, approval.Actions[1].ID, "", -32010)
 			tab.action(t, model.Chat.Approval.Actions[0].ID, "", 0)
-			model = tab.wait(t, func(m tabModel) bool { return m.Input != nil && !m.Refresh })
+			model = tab.wait(t, func(m tabModel) bool { return m.Input != nil && !m.Input.Disabled && !m.Refresh })
 			if model.Chat.Approval != nil || model.Text != "" {
 				t.Fatalf("Approval did not resolve: %+v", model)
 			}
@@ -895,7 +938,7 @@ func TestShutdownDuringPrompt(t *testing.T) {
 			tabResponse(t, r.expect(t, 3, 0))
 			tab := tabClient{r, 3}
 			tab.action(t, "new:codex", "", 0)
-			model := tab.wait(t, func(m tabModel) bool { return m.Input != nil })
+			model := tab.wait(t, func(m tabModel) bool { return m.Input != nil && !m.Input.Disabled })
 			tab.action(t, model.Input.ID, "wait", 0)
 			tab.wait(t, func(m tabModel) bool { return m.Refresh && hasMessage(m, "wait") })
 			if mode == "EOF" {
@@ -915,5 +958,165 @@ func TestShutdownDuringPrompt(t *testing.T) {
 				t.Fatal("Extension did not exit")
 			}
 		})
+	}
+}
+
+func TestRecoverFromFailedTurn(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := launch(t)
+	init := initialization(root)
+	init["host"].(map[string]any)["tabWidgets"] = 9
+	r.send(t, request(1, "ced/initialize", init))
+	r.expect(t, 1, 0)
+	r.send(t, request(2, "ced/activate", withContext("reason", map[string]string{"event": "onCommand:" + commandID})))
+	r.expect(t, 2, 0)
+	tab := tabClient{r, 2}
+	tab.action(t, "open", "", 0)
+	tab.action(t, "new:codex", "", 0)
+	ready := func(m tabModel) bool { return m.Input != nil && !m.Input.Disabled }
+	model := tab.wait(t, ready)
+	prompt := model.Input.ID
+	id := strings.TrimPrefix(prompt, "prompt:")
+	hasAction := func(model tabModel, actionID string) bool {
+		for _, action := range model.Actions {
+			if action.ID == actionID {
+				return true
+			}
+		}
+		return false
+	}
+
+	tab.action(t, prompt, "fixture-error", 0)
+	model = tab.wait(t, func(m tabModel) bool { return m.Text == "Fixture turn failed" })
+	if !ready(model) || model.Input.ID != prompt || !hasAction(model, "retry:"+id) {
+		t.Fatalf("Recoverable error hid the composer or retry: %+v", model)
+	}
+	tab.action(t, "retry:"+id, "", 0)
+	tab.wait(t, func(m tabModel) bool { return ready(m) && hasMessage(m, "Olá mundo 🙂") })
+
+	tab.action(t, prompt, "fixture-disconnect", 0)
+	model = tab.wait(t, func(m tabModel) bool { return hasAction(m, "reconnect:"+id) })
+	if model.Input == nil || model.Input.ID != prompt || !model.Input.Disabled ||
+		model.Chat.Status != "failed" || !hasMessage(model, "Partial reply") {
+		t.Fatalf("Disconnected chat lost the composer, error or partial response: %+v", model)
+	}
+	before := len(model.Chat.Messages)
+	tab.action(t, "reconnect:"+id, "", 0)
+	model = tab.wait(t, ready)
+	if model.Input.ID != prompt || len(model.Chat.Messages) != before || !hasMessage(model, "Partial reply") ||
+		hasMessage(model, "Replayed partial reply") || !hasAction(model, "retry:"+id) {
+		t.Fatalf("Reconnect changed the transcript or lost the explicit retry: %+v", model)
+	}
+	tab.action(t, "retry:"+id, "", 0)
+	model = tab.wait(t, func(m tabModel) bool { return ready(m) && len(m.Chat.Messages) == before+2 })
+	if model.Chat.Messages[before].Text != "fixture-disconnect" || model.Chat.Messages[before+1].Text != "Olá mundo 🙂" {
+		t.Fatalf("Explicit retry did not finish the turn after reconnecting: %+v", model.Chat.Messages)
+	}
+
+	tab.action(t, "back", "", 0)
+	tab.action(t, "harness", "devin", 0)
+	tab.action(t, "new:devin", "", 0)
+	model = tab.wait(t, ready)
+	id = strings.TrimPrefix(model.Input.ID, "prompt:")
+	tab.action(t, model.Input.ID, "fixture-disconnect", 0)
+	tab.wait(t, func(m tabModel) bool { return hasAction(m, "reconnect:"+id) })
+	tab.action(t, "reconnect:"+id, "", 0)
+	model = tab.wait(t, func(m tabModel) bool {
+		return m.Text == "Cannot restore this session" && hasAction(m, "new-after-error:"+id)
+	})
+	if model.Input == nil || !model.Input.Disabled || !hasMessage(model, "Partial reply") {
+		t.Fatalf("Failed reconnect erased the previous chat: %+v", model)
+	}
+	tab.action(t, "new-after-error:"+id, "", 0)
+	model = tab.wait(t, ready)
+	if model.Input.ID == "prompt:"+id || len(model.Chat.Messages) != 0 {
+		t.Fatalf("Fresh session reused the failed session or replayed its prompt: %+v", model)
+	}
+}
+
+func TestRunningSessionSurvivesWorkspaceChange(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := launch(t)
+	init := initialization(root)
+	init["host"].(map[string]any)["tabWidgets"] = 10
+	init["host"].(map[string]any)["workspaceChanges"] = true
+	r.send(t, request(1, "ced/initialize", init))
+	if result := r.expect(t, 1, 0); !strings.Contains(string(result.Result), `"retainOnWorkspaceChange":true`) {
+		t.Fatalf("Extension failed to opt in: %s", result.Result)
+	}
+	r.send(t, request(2, "ced/activate", withContext("reason", map[string]string{"event": "onCommand:" + commandID})))
+	r.expect(t, 2, 0)
+	tab := tabClient{r, 2}
+	tab.action(t, "open", "", 0)
+	tab.wait(t, func(m tabModel) bool { return !m.Refresh })
+	tab.action(t, groupAction(root), "", 0)
+	ready := func(m tabModel) bool { return m.Input != nil && !m.Input.Disabled }
+	chat := tab.wait(t, ready)
+	sessionAction := "session:" + strings.TrimPrefix(chat.Input.ID, "prompt:")
+	tab.action(t, chat.Input.ID, "wait", 0)
+	before := tab.wait(t, func(m tabModel) bool { return hasMessage(m, "Checking the results") })
+
+	next, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	newContext := map[string]any{"sessionId": mockContext["sessionId"], "workspaceId": "next", "generation": 3}
+	change := func(trusted bool, code int) {
+		tab.id++
+		r.send(t, request(tab.id, "ced/workspaceChanged", map[string]any{"context": newContext,
+			"workspace": map[string]any{"uri": (&url.URL{Scheme: "file", Path: next}).String(), "trusted": trusted}}))
+		r.expect(t, tab.id, code)
+	}
+	change(false, -32003)
+	change(true, 0)
+	tab.action(t, "refresh", "", -32003)
+	action := func(name string) tabModel { return tab.actionInContext(t, newContext, name, "", 0) }
+	chat = action("refresh")
+	if chat.Input == nil || chat.Input.ID != before.Input.ID || chat.Input.Stop != before.Input.Stop ||
+		!hasMessage(chat, "Checking the results") || !strings.HasSuffix(chat.Heading, root) {
+		t.Fatalf("Workspace change reset the active conversation: %+v", chat)
+	}
+	list := action("back")
+	if len(list.Groups) == 0 || list.Groups[0].Create != groupAction(next) {
+		t.Fatalf("New session did not default to the new workspace: %+v", list.Groups)
+	}
+	rowFor := func(model tabModel) tabSessionItem {
+		var active tabSessionItem
+		for _, group := range model.Groups {
+			for _, row := range group.Items {
+				if row.ID == sessionAction {
+					active = row
+				} else if row.Busy {
+					t.Fatalf("Inactive session shows a spinner: %+v", row)
+				}
+			}
+		}
+		if active.ID == "" {
+			t.Fatalf("Session disappeared from the list: %+v", model.Groups)
+		}
+		return active
+	}
+	refreshedList := action("refresh")
+	if first, refreshed := rowFor(list), rowFor(refreshedList); !list.Refresh || !refreshedList.Refresh ||
+		!first.Busy || first.Label != "wait" || refreshed != first {
+		t.Fatalf("Spinner state or session title changed unexpectedly: %+v, %+v", first, refreshed)
+	}
+
+	chat = action(sessionAction)
+	action(chat.Input.Stop)
+	for deadline := time.Now().Add(5 * time.Second); !ready(action("refresh")); time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("Timed out stopping the original agent")
+		}
+	}
+	list = action("back")
+	if row := rowFor(list); list.Refresh || row.Busy || row.Label != "wait" {
+		t.Fatalf("Idle session kept its working indicator: %+v", list)
 	}
 }
