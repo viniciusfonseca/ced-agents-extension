@@ -1120,3 +1120,27 @@ func TestRunningSessionSurvivesWorkspaceChange(t *testing.T) {
 		t.Fatalf("Idle session kept its working indicator: %+v", list)
 	}
 }
+
+func TestDirectoryLabelsAbbreviateHome(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "user")
+	t.Setenv("HOME", home)
+	dir := filepath.Join(home, "projects", "editor")
+	outside := filepath.Join(home+"-work", "editor")
+	if directoryLabel(home) != "~" || directoryLabel(outside) != outside {
+		t.Fatal("Directory labels did not respect the home directory boundary")
+	}
+	s := &session{ID: "1", Title: "Review", Agent: "Codex", providerID: "codex", cwd: dir}
+	view := agentsView{harness: "codex", tabWidgets: 10, sessions: sessions{root: outside, items: []*session{s}}}
+	group := view.model().Groups[1]
+	if group.Label != "~/projects/editor" || group.Create != groupAction(dir) {
+		t.Fatalf("Directory label or creation target is wrong: %+v", group)
+	}
+	view.tabWidgets = 7
+	if action := view.model().Actions[0]; action.Label != "Review · ~/projects/editor" {
+		t.Fatalf("Legacy session label used the full path: %+v", action)
+	}
+	view.selected = s.ID
+	if model := view.model(); model.Heading != "Review · Codex · ~/projects/editor" {
+		t.Fatalf("Chat heading used the full path: %s", model.Heading)
+	}
+}

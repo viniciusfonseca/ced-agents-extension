@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -227,7 +228,19 @@ func sessionListLabel(text string, limit int) string {
 }
 
 func sessionGroup(cwd string) tabSessionGroup {
-	return tabSessionGroup{Label: sessionListLabel(cwd, 1024), Create: groupAction(cwd), Items: []tabSessionItem{}}
+	return tabSessionGroup{Label: sessionListLabel(directoryLabel(cwd), 1024), Create: groupAction(cwd), Items: []tabSessionItem{}}
+}
+
+func directoryLabel(cwd string) string {
+	home, err := os.UserHomeDir()
+	if err != nil || !filepath.IsAbs(home) {
+		return cwd
+	}
+	relative, err := filepath.Rel(home, cwd)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return cwd
+	}
+	return filepath.Join("~", relative)
 }
 
 func sessionGroups(rows []historyEntry, spinners bool) []tabSessionGroup {

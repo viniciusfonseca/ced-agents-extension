@@ -344,7 +344,7 @@ func (v *agentsView) model() tabModel {
 			for _, row := range pageRows {
 				label := row.Title
 				if row.Cwd != v.sessions.root {
-					label = boundedText(label, 125) + " · " + row.Cwd
+					label = boundedText(label, 125) + " · " + directoryLabel(row.Cwd)
 				}
 				add(row.action, label)
 			}
@@ -376,7 +376,7 @@ func (v *agentsView) model() tabModel {
 	}
 	title := s.Title + " · " + s.Agent
 	if s.cwd != v.sessions.root {
-		title += " · " + s.cwd
+		title += " · " + directoryLabel(s.cwd)
 	}
 	model.Heading = displayText(title, false, 256)
 	model.Refresh = s.Busy || s.Cancelled || s.configuring || !s.Connected && s.peer != nil
