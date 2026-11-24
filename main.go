@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -19,7 +20,7 @@ import (
 
 const (
 	extensionID = "viniciusfonseca.agents"
-	version     = "0.4.18"
+	version     = "0.4.19"
 	commandID   = extensionID + ".open"
 	tabID       = extensionID + ".panel"
 )
@@ -122,11 +123,27 @@ type cedWorkspace struct {
 
 func (w cedWorkspace) path() string {
 	u, err := url.Parse(w.URI)
-	if err != nil || u.Scheme != "file" || u.Host != "" || u.User != nil || u.RawQuery != "" ||
-		u.Fragment != "" || !filepath.IsAbs(u.Path) || strings.ContainsRune(u.Path, 0) {
+	if err != nil || u.Scheme != "file" || u.User != nil || u.RawQuery != "" ||
+		u.Fragment != "" || strings.ContainsRune(u.Path, 0) {
 		return ""
 	}
-	return filepath.Clean(u.Path)
+	path := u.Path
+	if runtime.GOOS == "windows" {
+		if u.Host != "" {
+			if strings.ContainsAny(u.Host, "/\\:") || !strings.HasPrefix(path, "/") {
+				return ""
+			}
+			path = "//" + u.Host + path
+		} else if len(path) >= 3 && path[0] == '/' && path[2] == ':' {
+			path = path[1:]
+		}
+	} else if u.Host != "" {
+		return ""
+	}
+	if !filepath.IsAbs(path) {
+		return ""
+	}
+	return filepath.Clean(path)
 }
 
 func (p *cedPeer) handle(msg rpcMessage) (any, *rpcError, bool) {
@@ -311,19 +328,4 @@ func main() {
 	if err := runCED(ctx, input, output); err != nil && ctx.Err() == nil && err != io.EOF {
 		fmt.Fprintln(os.Stderr, "CED protocol:", err)
 	}
-}
-
-func pollablePipe(original *os.File) (*os.File, error) {
-	// CED passes blocking pipe descriptors. Adopt a nonblocking duplicate so
-	// closing it on SIGTERM wakes a pending read or write through Go's poller.
-	fd, err := syscall.Dup(int(original.Fd()))
-	if err != nil {
-		return nil, err
-	}
-	syscall.CloseOnExec(fd)
-	if err := syscall.SetNonblock(fd, true); err != nil {
-		_ = syscall.Close(fd)
-		return nil, err
-	}
-	return os.NewFile(uintptr(fd), original.Name()), nil
 }

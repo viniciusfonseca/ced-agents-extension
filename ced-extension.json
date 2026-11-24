@@ -2,7 +2,7 @@
   "manifestVersion": 1,
   "id": "viniciusfonseca.agents",
   "name": "Agents",
-  "version": "0.4.18",
+  "version": "0.4.19",
   "description": "Manage Codex, Claude Code and Devin sessions over ACP.",
   "license": "MIT",
   "ced": {
@@ -14,7 +14,10 @@
     "darwin-arm64": "bin/darwin-arm64/agents",
     "darwin-x86_64": "bin/darwin-x86_64/agents",
     "linux-arm64": "bin/linux-arm64/agents",
-    "linux-x86_64": "bin/linux-x86_64/agents"
+    "linux-x86_64": "bin/linux-x86_64/agents",
+    "windows-arm64": "bin/windows-arm64/agents.exe",
+    "windows-x86_64": "bin/windows-x86_64/agents.exe",
+    "windows-i686": "bin/windows-i686/agents.exe"
   },
   "activationEvents": [
     "onCommand:viniciusfonseca.agents.open"

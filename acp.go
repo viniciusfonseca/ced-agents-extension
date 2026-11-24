@@ -9,11 +9,8 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
-	"strings"
 	"sync"
-	"syscall"
 )
 
 type provider struct {
@@ -29,59 +26,27 @@ var providers = []provider{
 	{ID: "devin", Name: "Devin", command: "devin", args: []string{"acp"}},
 }
 
-func agentCommand(agent provider) (*exec.Cmd, error) {
-	home, err := os.UserHomeDir()
-	if err != nil || !filepath.IsAbs(home) {
-		return nil, errors.New("Agents requires an absolute HOME to find installed adapters.")
-	}
-	dirs := []string{filepath.Join(home, ".local", "bin"), "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"}
-	for _, dir := range dirs {
-		path := filepath.Join(dir, agent.command)
-		target, err := exec.LookPath(path)
-		if err != nil {
-			continue
-		}
-		searchPath := dirs
-		if realPath, err := filepath.EvalSymlinks(target); err == nil {
-			searchPath = append(append([]string{}, dirs...), filepath.Dir(realPath))
-			// npm links resolve into lib/node_modules; Node is often beside that prefix's bin.
-			if prefix, _, found := strings.Cut(realPath, "/lib/node_modules/"); found {
-				searchPath = append(searchPath, filepath.Join(prefix, "bin"))
-			}
-		}
-		cmd := exec.Command(target, agent.args...)
-		cmd.Env = []string{"HOME=" + home, "PATH=" + strings.Join(searchPath, ":")}
-		for _, key := range []string{"TMPDIR", "LANG", "LC_ALL", "LC_CTYPE"} {
-			if value, ok := os.LookupEnv(key); ok {
-				cmd.Env = append(cmd.Env, key+"="+value)
-			}
-		}
-		return cmd, nil
-	}
-	return nil, fmt.Errorf("Install %s and make %s available in ~/.local/bin or a system executable directory.", agent.Name, agent.command)
-}
-
 // ACP sends one JSON object per line. Replayed tool calls can include images.
 const maxACPMessageBytes = 16 << 20
 
 type acpPeer struct {
-	cmd       *exec.Cmd
-	stdin     io.WriteCloser
-	stdout    io.ReadCloser
-	done      chan struct{}
-	stopped   chan struct{}
-	readErr   error // Read after done is closed.
-	writeMu   sync.Mutex
-	mu        sync.Mutex
-	next      int
-	pending   map[string]chan rpcMessage
-	onMessage func(*acpPeer, rpcMessage)
-	stopOnce  sync.Once
+	cmd         *exec.Cmd
+	stdin       io.WriteCloser
+	stdout      io.ReadCloser
+	done        chan struct{}
+	stopped     chan struct{}
+	readErr     error // Read after done is closed.
+	writeMu     sync.Mutex
+	mu          sync.Mutex
+	next        int
+	pending     map[string]chan rpcMessage
+	onMessage   func(*acpPeer, rpcMessage)
+	stopOnce    sync.Once
+	stopAdapter func()
 }
 
 func startACP(cmd *exec.Cmd, root string, onMessage func(*acpPeer, rpcMessage)) (*acpPeer, error) {
 	cmd.Dir = root
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
@@ -91,12 +56,13 @@ func startACP(cmd *exec.Cmd, root string, onMessage func(*acpPeer, rpcMessage)) 
 		stdin.Close()
 		return nil, err
 	}
-	if err := cmd.Start(); err != nil {
+	stopAdapter, err := startAdapter(cmd)
+	if err != nil {
 		stdin.Close()
 		stdout.Close()
 		return nil, err
 	}
-	p := &acpPeer{cmd: cmd, stdin: stdin, stdout: stdout, pending: make(map[string]chan rpcMessage), done: make(chan struct{}), stopped: make(chan struct{}), onMessage: onMessage}
+	p := &acpPeer{cmd: cmd, stopAdapter: stopAdapter, stdin: stdin, stdout: stdout, pending: make(map[string]chan rpcMessage), done: make(chan struct{}), stopped: make(chan struct{}), onMessage: onMessage}
 	go p.read()
 	return p, nil
 }
@@ -126,7 +92,7 @@ func initializeACP(ctx context.Context, p *acpPeer) (acpInitialization, error) {
 func (p *acpPeer) stop() {
 	p.stopOnce.Do(func() {
 		close(p.stopped)
-		_ = syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL)
+		p.stopAdapter()
 		_ = p.stdin.Close()
 		_ = p.stdout.Close()
 	})

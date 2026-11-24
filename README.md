@@ -8,7 +8,7 @@ Read and send messages, stop turns, and answer permission requests inside CED. A
 
 ## Build and install
 
-Install Go 1.24 or later and run `make package` from the project directory. The build prints the absolute path to the installable project directory, which contains both `ced-extension.json` and the built `bin` directory. The compiled extension needs no Go installation at runtime. Run `make test` to build the package and run the automated tests with the race detector.
+Install Go 1.24 or later and run `make package` from the project directory using a POSIX shell and Make. The build prints the absolute path to the installable project directory, which contains both `ced-extension.json` and the built `bin` directory. The compiled extension needs no Go installation at runtime. On macOS or Linux, run `make test` to build the package and run the automated tests with the race detector.
 
 In CED, use **Install Extension from Folder** in the command palette and select the `ced-agents-extension` directory. On macOS, press **Command+Shift+G** in the folder picker to paste the path printed by the build. Review the package and trust the workspace through **Manage Extensions**. Run **Open Agents** from the palette. Disable or uninstall **Agents** in **Manage Extensions** to stop the local interface and connected adapters.
 
@@ -18,10 +18,13 @@ In CED, use **Install Extension from Folder** in the command palette and select 
 | macOS x86_64 | Cross-compiled | Packaged tests via Rosetta |
 | Linux arm64 | Cross-compiled | Packaged tests in Docker |
 | Linux x86_64 | Cross-compiled | Packaged tests in Docker |
+| Windows arm64 | Cross-compiled | Requires a Windows CED build with extensions enabled |
+| Windows x86_64 | Cross-compiled | Requires a Windows CED build with extensions enabled |
+| Windows i686 | Cross-compiled | Requires a Windows CED build with extensions enabled |
 
 ## Agent runtimes
 
-Install and authenticate each agent you want to use separately. The extension searches `~/.local/bin`, `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, and `/bin` for the indicated executables. To use adapters installed by a shell version manager, link their executables from `~/.local/bin`. Node must be available to the npm launchers. CED starts the extension with a reduced environment. Use the providers' own CLI sign-in and credential stores.
+Install and authenticate each agent you want to use separately. On macOS and Linux, the extension searches `~/.local/bin`, `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, and `/bin` for the indicated executables. To use adapters installed by a shell version manager, link their executables from `~/.local/bin`. On Windows, place native adapter executables in `%USERPROFILE%\.local\bin`. The extension can also run the Codex and Claude adapters from the default global npm directory (`%APPDATA%\npm`) with Node.js installed in Program Files or `%USERPROFILE%\.local\bin`. CED starts the extension with a reduced environment. Use the providers' own CLI sign-in and credential stores.
 
 | Agent | Executable and arguments | Upstream |
 | --- | --- | --- |
@@ -44,4 +47,4 @@ The [ACP Registry](https://cdn.agentclientprotocol.com/registry/v1/latest/regist
 
 ## Compatibility and tests
 
-Agents 0.4.18 requires a CED build that advertises `host.tabProtocol: 1` and `host.tabWidgets` of at least `1`. Version `3` places both selectors in the CUI composer. With version `4`, the chat also shows collapsible reasoning reported by the adapter and tool calls with their status and input/output previews when available. This works during live turns and when an adapter replays saved activity. With version `5`, the composer replaces Send with Stop during a cancellable turn. Version `6` adds a typewriter effect to new agent messages. Version `7` shows a back chevron next to the chat title. Version `8` groups sessions by directory and adds per-directory creation and per-session deletion. Version `9` places approval requests and the approval mode picker in the composer. Version `10` adds native spinners to the session list. Press Enter to send and Shift+Enter for a newline. See [TESTING.md](TESTING.md) for test coverage.
+Agents 0.4.19 requires a CED build that advertises `host.tabProtocol: 1` and `host.tabWidgets` of at least `1`. Version `3` places both selectors in the CUI composer. With version `4`, the chat also shows collapsible reasoning reported by the adapter and tool calls with their status and input/output previews when available. This works during live turns and when an adapter replays saved activity. With version `5`, the composer replaces Send with Stop during a cancellable turn. Version `6` adds a typewriter effect to new agent messages. Version `7` shows a back chevron next to the chat title. Version `8` groups sessions by directory and adds per-directory creation and per-session deletion. Version `9` places approval requests and the approval mode picker in the composer. Version `10` adds native spinners to the session list. Press Enter to send and Shift+Enter for a newline. See [TESTING.md](TESTING.md) for test coverage.
