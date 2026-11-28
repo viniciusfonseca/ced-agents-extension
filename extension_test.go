@@ -547,7 +547,7 @@ func TestPackagedEndToEnd(t *testing.T) {
 		prompt := model.Input.ID
 		id := strings.TrimPrefix(prompt, "prompt:")
 		if agent.ID == "devin" {
-			if model.Selectors[0].Selected != "" || model.Selectors[1].Selected != "" {
+			if len(model.Selectors) != 1 || model.Selectors[0].Label != "Model" || model.Selectors[0].Selected != "" {
 				t.Fatalf("Unexpected configuration: %+v", model.Selectors)
 			}
 		} else {
@@ -783,8 +783,14 @@ func TestSessionSelectorsWhileConnecting(t *testing.T) {
 		t.Fatalf("Connecting session should hide its selectors: %+v", model)
 	}
 	active.Connected = true
+	active.config = []configOption{{ID: "effort", Category: "thought_level", Type: "select"}}
 	model = view.model()
-	if model.Text != "Working..." || len(model.Selectors) != 3 {
+	if model.Text != "Working..." || len(model.Selectors) != 2 || model.Selectors[1].Label != "Approval Mode" {
+		t.Fatalf("Empty effort options should hide only the effort picker: %+v", model)
+	}
+	active.config[0].Options = []configChoice{{Value: "high", Name: "High"}}
+	model = view.model()
+	if model.Text != "Working..." || len(model.Selectors) != 3 || model.Selectors[1].Label != "Effort" {
 		t.Fatalf("Connected session should show its selectors during a turn: %+v", model)
 	}
 }
@@ -806,10 +812,15 @@ func TestComposerApprovalsAndModes(t *testing.T) {
 		tab.action(t, "harness", harness, 0)
 		tab.action(t, groupAction(root), "", 0)
 		model := tab.wait(t, func(m tabModel) bool { return m.Input != nil && !m.Input.Disabled && !m.Refresh })
-		if len(model.Selectors) != 3 || model.Selectors[2].Placement != "composer" {
+		last := len(model.Selectors) - 1
+		expected := 3
+		if harness == "devin" {
+			expected = 2
+		}
+		if len(model.Selectors) != expected || model.Selectors[last].Label != "Approval Mode" || model.Selectors[last].Placement != "composer" {
 			t.Fatalf("Missing approval mode picker: %+v", model.Selectors)
 		}
-		mode := model.Selectors[2]
+		mode := model.Selectors[last]
 		if harness == "devin" {
 			if len(mode.Options) != 0 || mode.Selected != "" {
 				t.Fatalf("Unadvertised permission modes appeared: %+v", mode)

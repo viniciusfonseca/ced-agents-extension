@@ -382,12 +382,16 @@ func (v *agentsView) model() tabModel {
 	model.Refresh = s.Busy || s.Cancelled || s.configuring || !s.Connected && s.peer != nil
 	loading := s.Busy && !s.Connected
 	if !loading {
-		model.Selectors = []tabSelector{s.selector("model", "Model"), s.selector("thought_level", "Effort")}
+		model.Selectors = []tabSelector{s.selector("model", "Model")}
 		if v.tabWidgets >= 2 {
 			model.Selectors[0].Placement = "composer"
 		}
-		if v.tabWidgets >= 3 {
-			model.Selectors[1].Placement = "composer"
+		effort := s.selector("thought_level", "Effort")
+		if len(effort.Options) > 0 {
+			if v.tabWidgets >= 3 {
+				effort.Placement = "composer"
+			}
+			model.Selectors = append(model.Selectors, effort)
 		}
 		if v.tabWidgets >= 9 {
 			approval := s.selector("mode", "Approval Mode")
